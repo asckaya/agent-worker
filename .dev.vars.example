@@ -1,0 +1,17 @@
+ADMIN_TOKEN=change-me
+
+# Telegram webhook support
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_SECRET_TOKEN=change-telegram-secret
+TELEGRAM_ALLOWED_CHAT_IDS=
+TELEGRAM_ALLOW_ALL_CHATS=false
+TELEGRAM_ADMIN_USER_IDS=
+TELEGRAM_STREAM_TRANSPORT=auto
+TELEGRAM_TEXT_BATCH_MS=180
+
+# Server-side LLM config used by Telegram and the HTTP test channel.
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_API_KEY=
+LLM_MODEL=gpt-4.1-mini
+LLM_TEMPERATURE=0.7
+LLM_MAX_TOKENS=1200

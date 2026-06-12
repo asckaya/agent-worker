@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "agent-worker",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-06-10",
+  "assets": {
+    "directory": "./dist/client",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "AGENT_OBJECT",
+        "class_name": "UserAgentObject"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["UserAgentObject"]
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}
