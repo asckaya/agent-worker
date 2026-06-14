@@ -9,6 +9,7 @@
     "build": "bun run typecheck && bun run build:client",
     "build:client": "vite build",
     "deploy:dry-run": "bun run build && CI=1 HOME=.wrangler-home wrangler deploy --dry-run --outdir dist/worker",
+    "telegram:set-commands": "bun run scripts/telegram-set-commands.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",

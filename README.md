@@ -91,6 +91,13 @@ curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
   -d "secret_token=$TELEGRAM_SECRET_TOKEN"
 ```
 
+Register the Telegram command menu so commands appear in the bot UI:
+
+```bash
+export TELEGRAM_BOT_TOKEN=...
+bun run telegram:set-commands
+```
+
 For Cloudflare deployment, store sensitive values as encrypted Worker secrets, not plain variables:
 
 ```bash
@@ -139,6 +146,7 @@ bun run test:coverage
 bun run test:full
 bun run build
 bun run deploy:dry-run
+bun run telegram:set-commands
 ```
 
 `bun run build` runs typecheck and builds the status-page assets, which is the right command for Cloudflare Git builds. `bun run deploy:dry-run` additionally runs the Wrangler dry-run build and writes Wrangler config/log state under `.wrangler-home` inside the project. `bun run test:coverage` runs the Vitest suite with V8 coverage and writes HTML/lcov reports under `coverage/`. `bun run test:full` runs tests plus the Wrangler dry-run build.
