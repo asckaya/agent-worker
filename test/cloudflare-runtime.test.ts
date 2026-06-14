@@ -9,6 +9,7 @@ describe("Cloudflare runtime boundary", () => {
       assets?: unknown;
       durable_objects?: unknown;
       migrations?: unknown;
+      keep_vars?: unknown;
       compatibility_flags?: unknown;
       d1_databases?: unknown;
       kv_namespaces?: unknown;
@@ -17,6 +18,7 @@ describe("Cloudflare runtime boundary", () => {
     };
 
     expect(wrangler.main).toBe("src/worker/index.ts");
+    expect(wrangler.keep_vars).toBe(true);
     expect(wrangler.assets).toMatchObject({
       directory: "./dist/client",
       binding: "ASSETS",

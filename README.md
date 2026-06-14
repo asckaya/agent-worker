@@ -91,7 +91,16 @@ curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
   -d "secret_token=$TELEGRAM_SECRET_TOKEN"
 ```
 
-For Cloudflare deployment, store sensitive values with `wrangler secret put`.
+For Cloudflare deployment, store sensitive values as encrypted Worker secrets, not plain variables:
+
+```bash
+wrangler secret put ADMIN_TOKEN
+wrangler secret put TELEGRAM_BOT_TOKEN
+wrangler secret put TELEGRAM_SECRET_TOKEN
+wrangler secret put LLM_API_KEY
+```
+
+User-specific runtime settings such as `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_ADMIN_USER_IDS`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_TEMPERATURE`, and `LLM_MAX_TOKENS` can be set in the Cloudflare Dashboard under Worker variables and secrets. `wrangler.jsonc` sets `keep_vars: true` so Git/CLI deploys preserve Dashboard-managed runtime configuration instead of deleting it.
 
 ## HTTP Test Channel
 
