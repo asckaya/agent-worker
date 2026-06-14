@@ -14,6 +14,7 @@ export interface Env {
   LLM_MODEL?: string;
   LLM_TEMPERATURE?: string;
   LLM_MAX_TOKENS?: string;
+  LLM_PROFILES_JSON?: string;
   GITHUB_TOKEN?: string;
 }
 

@@ -6,6 +6,16 @@ import type { AgentStreamEvent, AgentStreamEventName } from "../channels/types";
 import {
   DurableObjectMemoryProvider,
 } from "../memory/provider";
+import {
+  createEnvLlmSettings,
+  getActiveLlmProfile,
+  LLM_SETTINGS_KEY,
+  parseLlmActiveProfilePayload,
+  parseLlmSettingsPayload,
+  resolveLlmConfigFromSettings,
+  summarizeLlmSettings,
+  type LlmSettings,
+} from "../llm/settings";
 import { streamChatCompletion } from "../model/openai-compatible";
 import { createDefaultToolRegistry } from "../tools";
 import { DEFAULT_TOOL_TIMEOUT_MS, ToolExecutor } from "../tools/executor";
@@ -61,6 +71,12 @@ interface PendingApprovalRow {
   risk: string;
   created_at: number;
   expires_at: number;
+}
+
+interface RuntimeSettingRow {
+  key: string;
+  value_json: string;
+  updated_at: number;
 }
 
 interface ActiveRunRecord extends Omit<ActiveAgentRun, "queuedMessageCount"> {
@@ -119,6 +135,7 @@ export class UserAgentObject {
         memories: this.getMemories(),
         pendingApprovals: this.getPendingApprovals(),
         activeRuns: this.getActiveRuns(),
+        llm: this.getLlmSettingsSummary(),
         limits: {
           maxMemoryItems: MAX_MEMORY_ITEMS,
           maxMemoryChars: MAX_MEMORY_CHARS,
@@ -130,6 +147,27 @@ export class UserAgentObject {
 
     if (request.method === "POST" && url.pathname === "/memories") {
       return this.handleCreateMemory(request);
+    }
+
+    if (request.method === "GET" && url.pathname === "/settings/llm") {
+      return Response.json({ ok: true, ...this.getLlmSettingsResponse() });
+    }
+
+    if (request.method === "PUT" && url.pathname === "/settings/llm") {
+      return this.handleUpdateLlmSettings(request);
+    }
+
+    if (request.method === "DELETE" && url.pathname === "/settings/llm") {
+      this.deleteRuntimeSetting(LLM_SETTINGS_KEY);
+      return Response.json({ ok: true, ...this.getLlmSettingsResponse() });
+    }
+
+    if (request.method === "POST" && url.pathname === "/settings/llm/active") {
+      return this.handleActivateLlmProfile(request);
+    }
+
+    if (request.method === "POST" && url.pathname === "/settings/llm/test") {
+      return this.handleTestLlmSettings();
     }
 
     if (request.method === "DELETE" && url.pathname.startsWith("/memories/")) {
@@ -188,6 +226,85 @@ export class UserAgentObject {
 
     const memory = this.saveMemory(body.content);
     return Response.json({ ok: true, memory, memories: this.getMemories() });
+  }
+
+  private async handleUpdateLlmSettings(request: Request) {
+    try {
+      const settings = parseLlmSettingsPayload(await request.json().catch(() => ({})));
+      this.saveRuntimeSetting(LLM_SETTINGS_KEY, settings);
+      return Response.json({ ok: true, ...this.getLlmSettingsResponse() });
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  private async handleActivateLlmProfile(request: Request) {
+    try {
+      const { profileId } = parseLlmActiveProfilePayload(await request.json().catch(() => ({})));
+      const current = this.getEffectiveLlmSettings();
+      if (!current.settings) {
+        throw new HttpError("No LLM profiles are configured.", 404);
+      }
+      if (!current.settings.profiles.some((profile) => profile.id === profileId)) {
+        throw new HttpError(`Unknown LLM profile: ${profileId}`, 404);
+      }
+
+      const settings = {
+        ...current.settings,
+        activeProfileId: profileId,
+      };
+      this.saveRuntimeSetting(LLM_SETTINGS_KEY, settings);
+      return Response.json({ ok: true, ...this.getLlmSettingsResponse() });
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  private async handleTestLlmSettings() {
+    const current = this.getEffectiveLlmSettings();
+    if (!current.settings) {
+      return Response.json(
+        { ok: false, error: "No LLM profiles are configured." },
+        { status: 400 },
+      );
+    }
+
+    const config = resolveLlmConfigFromSettings(current.settings, this.env);
+    if (config instanceof Error) {
+      return Response.json({ ok: false, error: config.message }, { status: 400 });
+    }
+
+    const profile = getActiveLlmProfile(current.settings);
+    try {
+      const result = await streamChatCompletion({
+        config,
+        messages: [
+          {
+            role: "user",
+            content: "Reply with a concise OK if this LLM profile is configured correctly.",
+          },
+        ],
+        onToken: async () => undefined,
+      });
+
+      return Response.json({
+        ok: true,
+        source: current.source,
+        profileId: profile.id,
+        model: profile.model,
+        baseUrl: profile.baseUrl,
+        content: result.content,
+      });
+    } catch (error) {
+      return Response.json(
+        {
+          ok: false,
+          profileId: profile.id,
+          error: error instanceof Error ? error.message : "LLM test failed.",
+        },
+        { status: 502 },
+      );
+    }
   }
 
   private async handleChat(request: Request) {
@@ -662,6 +779,13 @@ export class UserAgentObject {
   private ensureSchema() {
     this.memoryProvider.ensureSchema();
     this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS runtime_settings (
+        key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS pending_approvals (
         id TEXT PRIMARY KEY,
         channel TEXT NOT NULL,
@@ -685,6 +809,66 @@ export class UserAgentObject {
 
   private getActiveRuns(): ActiveAgentRun[] {
     return [...this.activeRuns.values()].map(activeRunToStatus);
+  }
+
+  private getStoredLlmSettings(): LlmSettings | null {
+    const row = this.query<RuntimeSettingRow>(
+      "SELECT key, value_json, updated_at FROM runtime_settings WHERE key = ? LIMIT 1",
+      LLM_SETTINGS_KEY,
+    )[0];
+    if (!row) return null;
+
+    try {
+      return parseLlmSettingsPayload(JSON.parse(row.value_json));
+    } catch {
+      return null;
+    }
+  }
+
+  private getEffectiveLlmSettings() {
+    const stored = this.getStoredLlmSettings();
+    if (stored) return { source: "stored" as const, settings: stored };
+    const envSettings = createEnvLlmSettings(this.env);
+    return envSettings
+      ? { source: "env" as const, settings: envSettings }
+      : { source: "none" as const, settings: null };
+  }
+
+  private getLlmSettingsSummary() {
+    const current = this.getEffectiveLlmSettings();
+    return current.settings
+      ? {
+          source: current.source,
+          ...summarizeLlmSettings(current.settings, this.env),
+        }
+      : { source: "none" as const, activeProfileId: undefined, profiles: [] };
+  }
+
+  private getLlmSettingsResponse() {
+    return {
+      source: this.getEffectiveLlmSettings().source,
+      settings: this.getEffectiveLlmSettings().settings,
+      summary: this.getLlmSettingsSummary(),
+    };
+  }
+
+  private saveRuntimeSetting(key: string, value: unknown) {
+    this.ctx.storage.sql.exec(
+      `
+        INSERT INTO runtime_settings (key, value_json, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+          value_json = excluded.value_json,
+          updated_at = excluded.updated_at
+      `,
+      key,
+      JSON.stringify(value),
+      Date.now(),
+    );
+  }
+
+  private deleteRuntimeSetting(key: string) {
+    this.ctx.storage.sql.exec("DELETE FROM runtime_settings WHERE key = ?", key);
   }
 
   private getActiveRun(source: ChannelSource | undefined) {

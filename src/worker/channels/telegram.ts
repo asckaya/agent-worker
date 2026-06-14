@@ -1,5 +1,6 @@
 import { parseSlashCommand, type SlashCommand } from "./commands";
 import { fetchAgentObject } from "./agent-object";
+import { resolveRequiredChannelLlm } from "./llm-config";
 import { readServerSentEvents } from "./sse";
 import type { AgentStreamEvent, ChannelAdapter, ChannelCapabilities } from "./types";
 import type { ActiveAgentRun, Env, LlmConfig, PendingToolApproval, StoredMemory } from "../types";
@@ -20,7 +21,7 @@ const TELEGRAM_TEXT_BATCH_DEFAULT_MS = 180;
 const TELEGRAM_TEXT_BATCH_MAX_MS = 1_000;
 const TELEGRAM_TEXT_BATCH_MAX_MESSAGES = 6;
 const TELEGRAM_TEXT_BATCH_MAX_CHARS = 16_000;
-const MUTATING_COMMANDS = new Set(["approve", "deny", "forget", "stop", "new", "reset"]);
+const MUTATING_COMMANDS = new Set(["approve", "deny", "forget", "stop", "new", "reset", "llmuse"]);
 
 type TelegramStreamTransport = "auto" | "draft" | "edit" | "off";
 type TelegramStreamMode = "draft" | "edit" | "off";
@@ -101,6 +102,26 @@ interface AgentStateResponse {
   memories?: StoredMemory[];
   pendingApprovals?: PendingToolApproval[];
   activeRuns?: ActiveAgentRun[];
+  llm?: LlmSettingsResponse["summary"] & { source?: string };
+}
+
+interface LlmSettingsSummaryProfile {
+  id: string;
+  name?: string;
+  baseUrl: string;
+  model: string;
+  apiKeyEnv: string;
+  hasApiKey: boolean;
+  temperature?: number;
+  maxTokens?: number;
+}
+
+interface LlmSettingsResponse {
+  source?: string;
+  summary?: {
+    activeProfileId?: string;
+    profiles?: LlmSettingsSummaryProfile[];
+  };
 }
 
 interface TelegramTextBatch {
@@ -368,6 +389,20 @@ async function handleAllowedTelegramMessage(
         incoming.messageId,
       );
       return;
+    case "llm":
+      await sendTelegramMessage(
+        env,
+        incoming.chatId,
+        await llmSettingsText(env, requestUrl),
+        incoming.messageId,
+      );
+      return;
+    case "llmuse":
+      await handleLlmUseCommand(env, requestUrl, incoming, command);
+      return;
+    case "llmtest":
+      await handleLlmTestCommand(env, requestUrl, incoming);
+      return;
     case "forget":
       await handleForgetCommand(env, requestUrl, incoming, command);
       return;
@@ -406,6 +441,9 @@ function helpText() {
     "Commands:",
     "/status - show runtime status",
     "/memory - list saved memories",
+    "/llm - show LLM profiles",
+    "/llmuse <profile_id> - switch active LLM profile",
+    "/llmtest - test the active LLM profile",
     "/forget <memory_id> - delete a memory",
     "/pending - list pending tool approvals",
     "/approve <id> - approve a pending tool call",
@@ -420,12 +458,12 @@ function helpText() {
 
 async function statusText(env: Env, requestUrl: string) {
   const state = await fetchAgentState(env, requestUrl);
-  const llm = buildTelegramLlmConfig(env);
+  const activeLlm = activeLlmProfileLabel(state.llm);
   const queuedFollowUps =
     state.activeRuns?.reduce((total, run) => total + run.queuedMessageCount, 0) ?? 0;
   return [
     "Status: ok",
-    `Model: ${llm instanceof Error ? "not configured" : llm.model}`,
+    `Model: ${activeLlm}`,
     `Memories: ${state.memories?.length ?? 0}`,
     `Pending approvals: ${state.pendingApprovals?.length ?? 0}`,
     `Active runs: ${state.activeRuns?.length ?? 0}`,
@@ -442,6 +480,93 @@ async function memoryText(env: Env, requestUrl: string) {
     .slice(0, 12)
     .map((memory) => `${memory.id}: ${memory.content}`)
     .join("\n\n");
+}
+
+async function llmSettingsText(env: Env, requestUrl: string) {
+  const settings = await fetchLlmSettings(env, requestUrl);
+  const summary = settings.summary;
+  const profiles = summary?.profiles ?? [];
+  if (profiles.length === 0) {
+    return "No LLM profiles are configured.";
+  }
+
+  return [
+    `LLM settings: ${settings.source ?? "unknown"}`,
+    `Active: ${summary?.activeProfileId ?? "unknown"}`,
+    "",
+    ...profiles.map((profile) => {
+      const active = profile.id === summary?.activeProfileId ? "active" : "available";
+      const key = profile.hasApiKey ? "key configured" : `missing ${profile.apiKeyEnv}`;
+      const limits = [
+        typeof profile.temperature === "number" ? `temperature=${profile.temperature}` : "",
+        typeof profile.maxTokens === "number" ? `maxTokens=${profile.maxTokens}` : "",
+      ].filter(Boolean);
+      return [
+        `${profile.id} (${active})`,
+        profile.name ? `name: ${profile.name}` : "",
+        `model: ${profile.model}`,
+        `baseUrl: ${profile.baseUrl}`,
+        `secret: ${profile.apiKeyEnv} (${key})`,
+        limits.join(", "),
+      ].filter(Boolean).join("\n");
+    }),
+    "",
+    "Use /llmuse <profile_id> to switch profiles.",
+  ].join("\n");
+}
+
+async function handleLlmUseCommand(
+  env: Env,
+  requestUrl: string,
+  incoming: IncomingTelegramText,
+  command: SlashCommand,
+) {
+  const profileId = firstArg(command.args);
+  if (!profileId) {
+    await sendTelegramMessage(env, incoming.chatId, "Usage: /llmuse <profile_id>", incoming.messageId);
+    return;
+  }
+
+  const response = await fetchAgentObject(env, requestUrl, "/settings/llm/active", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ profileId }),
+  });
+  const body = (await response.json().catch(() => ({}))) as { error?: string };
+  if (!response.ok || body.error) {
+    throw new Error(body.error || `LLM profile switch failed: ${response.status}`);
+  }
+
+  await sendTelegramMessage(env, incoming.chatId, `Active LLM profile: ${profileId}`, incoming.messageId);
+}
+
+async function handleLlmTestCommand(
+  env: Env,
+  requestUrl: string,
+  incoming: IncomingTelegramText,
+) {
+  const response = await fetchAgentObject(env, requestUrl, "/settings/llm/test", {
+    method: "POST",
+  });
+  const body = (await response.json().catch(() => ({}))) as {
+    ok?: boolean;
+    profileId?: string;
+    model?: string;
+    content?: string;
+    error?: string;
+  };
+  if (!response.ok || body.ok === false) {
+    throw new Error(body.error || `LLM test failed: ${response.status}`);
+  }
+
+  await sendTelegramMessage(
+    env,
+    incoming.chatId,
+    [`LLM test ok: ${body.profileId ?? "unknown"}`, `Model: ${body.model ?? "unknown"}`, body.content ?? ""]
+      .filter(Boolean)
+      .join("\n"),
+    incoming.messageId,
+  );
 }
 
 async function pendingApprovalsText(env: Env, requestUrl: string, chatId: string) {
@@ -485,7 +610,7 @@ async function handleApproveCommand(
     return;
   }
 
-  const llm = buildTelegramLlmConfig(env);
+  const llm = await resolveRequiredChannelLlm(env, requestUrl, undefined, "Telegram");
   await streamAgentEndpointToTelegram(
     env,
     requestUrl,
@@ -650,7 +775,7 @@ async function flushTelegramTextBatch(key: string) {
 }
 
 async function handleAgentMessage(env: Env, requestUrl: string, incoming: IncomingTelegramText) {
-  const llm = buildTelegramLlmConfig(env);
+  const llm = await resolveRequiredChannelLlm(env, requestUrl, undefined, "Telegram");
   if (llm instanceof Error) {
     await sendTelegramMessage(env, incoming.chatId, llm.message, incoming.messageId);
     return;
@@ -1128,6 +1253,19 @@ async function fetchAgentState(env: Env, requestUrl: string): Promise<AgentState
   const response = await fetchAgentObject(env, requestUrl, "/state", { method: "GET" });
   if (!response.ok) return {};
   return (await response.json().catch(() => ({}))) as AgentStateResponse;
+}
+
+async function fetchLlmSettings(env: Env, requestUrl: string): Promise<LlmSettingsResponse> {
+  const response = await fetchAgentObject(env, requestUrl, "/settings/llm", { method: "GET" });
+  if (!response.ok) return {};
+  return (await response.json().catch(() => ({}))) as LlmSettingsResponse;
+}
+
+function activeLlmProfileLabel(summary: AgentStateResponse["llm"]) {
+  const active = summary?.profiles?.find((profile) => profile.id === summary.activeProfileId);
+  if (!active) return "not configured";
+  const keyState = active.hasApiKey ? "" : ` (${active.apiKeyEnv} missing)`;
+  return `${active.model} [${active.id}]${keyState}`;
 }
 
 async function fetchPendingApprovals(env: Env, requestUrl: string, chatId: string) {

@@ -8,9 +8,10 @@ The runtime is split into `model / tool / channel` layers. Telegram is the first
 
 - The web surface is status-only, not a chat client.
 - Telegram messages are used for the current turn and are not stored as conversation history.
-- Durable Object SQLite stores only bounded `memories` and short-lived pending tool approvals.
+- Durable Object SQLite stores bounded `memories`, short-lived pending tool approvals, and bounded non-secret LLM profile overrides.
 - Active Telegram run state, approval continuation runs, paused approval sessions, and queued follow-up messages are kept in Durable Object memory only; they are not persisted as chat history.
-- Telegram uses server-side LLM env vars because it has no browser-local key store.
+- Telegram uses server-side LLM secrets/env vars because it has no browser-local key store.
+- LLM API keys are Worker secrets/env bindings only; they are not stored in Durable Object SQLite, docs, or client state.
 - Memory is capped at 200 items and 1200 characters per item.
 
 ## Tooling
@@ -35,7 +36,7 @@ Telegram uses separate protection:
 
 - `TELEGRAM_SECRET_TOKEN` validates Telegram webhook requests through the `X-Telegram-Bot-Api-Secret-Token` header.
 - `TELEGRAM_ALLOWED_CHAT_IDS` limits who can use the bot.
-- `TELEGRAM_ADMIN_USER_IDS` optionally limits mutating commands (`/approve`, `/deny`, `/forget`) to specific Telegram users.
+- `TELEGRAM_ADMIN_USER_IDS` optionally limits mutating commands (`/approve`, `/deny`, `/forget`, `/stop`, `/new`, `/reset`, `/llmuse`) to specific Telegram users.
 - `TELEGRAM_STREAM_TRANSPORT` optionally controls streaming: `auto` default, `draft`, `edit`, or `off`.
 - `TELEGRAM_TEXT_BATCH_MS` optionally controls short incoming text debounce; default is `180`, max is `1000`, `0` disables batching.
 - `/id` in Telegram replies with the current chat id so you can add it to the allowlist.
@@ -44,6 +45,9 @@ Telegram commands:
 
 - `/status`
 - `/memory`
+- `/llm`
+- `/llmuse <profile_id>`
+- `/llmtest`
 - `/forget <memory_id>`
 - `/pending`
 - `/approve <id>`
@@ -83,6 +87,30 @@ LLM_API_KEY=...
 LLM_MODEL=gpt-4.1-mini
 ```
 
+For one model, `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL` are enough. For multiple models, keep API keys in separate Worker secrets and store only profile metadata in `LLM_PROFILES_JSON` or through the protected LLM settings API:
+
+```json
+{
+  "activeProfileId": "openrouter-free",
+  "profiles": [
+    {
+      "id": "openrouter-free",
+      "name": "OpenRouter free",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "model": "google/gemma-4-31b-it:free",
+      "apiKeyEnv": "OPENROUTER_API_KEY",
+      "maxTokens": 16384,
+      "extraHeaders": {
+        "HTTP-Referer": "https://YOUR_WORKER_DOMAIN",
+        "X-Title": "agent-worker"
+      }
+    }
+  ]
+}
+```
+
+`apiKeyEnv` is the Worker secret/env binding name to read at runtime. Do not put the actual API key in the profile JSON. Secret-bearing headers such as `Authorization` and `X-API-Key` are rejected in `extraHeaders`; use `apiKeyEnv` instead.
+
 Register the webhook:
 
 ```bash
@@ -105,9 +133,12 @@ wrangler secret put ADMIN_TOKEN
 wrangler secret put TELEGRAM_BOT_TOKEN
 wrangler secret put TELEGRAM_SECRET_TOKEN
 wrangler secret put LLM_API_KEY
+wrangler secret put OPENROUTER_API_KEY
 ```
 
-User-specific runtime settings such as `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_ADMIN_USER_IDS`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_TEMPERATURE`, and `LLM_MAX_TOKENS` can be set in the Cloudflare Dashboard under Worker variables and secrets. `wrangler.jsonc` sets `keep_vars: true` so Git/CLI deploys preserve Dashboard-managed runtime configuration instead of deleting it.
+User-specific runtime settings such as `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_ADMIN_USER_IDS`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_TEMPERATURE`, `LLM_MAX_TOKENS`, and `LLM_PROFILES_JSON` can be set in the Cloudflare Dashboard under Worker variables and secrets. `wrangler.jsonc` sets `keep_vars: true` so Git/CLI deploys preserve Dashboard-managed runtime configuration instead of deleting it.
+
+Wrangler local dev reads `.dev.vars`; use that instead of `.env` for local Worker secrets. For production, use Worker secrets for sensitive values and plain variables only for non-secret allowlists/profile metadata.
 
 ## HTTP Test Channel
 
@@ -136,6 +167,35 @@ Approval and control endpoints:
 - `POST /api/test-channel/stop`
 - `GET /api/test-channel/approvals?chatId=local`
 - `GET /api/test-channel/state`
+- `GET|PUT|DELETE /api/test-channel/llm`
+- `POST /api/test-channel/llm/active`
+- `POST /api/test-channel/llm/test`
+
+Update persisted LLM profile metadata through the protected test channel:
+
+```bash
+curl "https://YOUR_WORKER_DOMAIN/api/test-channel/llm" \
+  -X PUT \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d @llm-settings.json
+```
+
+Switch and test the active profile:
+
+```bash
+curl "https://YOUR_WORKER_DOMAIN/api/test-channel/llm/active" \
+  -X POST \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"profileId":"openrouter-free"}'
+
+curl "https://YOUR_WORKER_DOMAIN/api/test-channel/llm/test" \
+  -X POST \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+The same profile list is visible in Telegram with `/llm`; `/llmuse <profile_id>` switches the active profile and `/llmtest` checks that the selected profile can call the provider.
 
 ## Scripts
 

@@ -1,12 +1,12 @@
 import { z } from "zod";
 import { fetchAgentObject } from "./agent-object";
+import { resolveOptionalChannelLlm, resolveRequiredChannelLlm } from "./llm-config";
 import { readServerSentEvents } from "./sse";
 import type { AgentStreamEvent, ChannelAdapter, ChannelCapabilities } from "./types";
 import type { Env, LlmConfig } from "../types";
 import {
   ClientChatMessageSchema,
   LlmConfigSchema,
-  parseServerLlmEnv,
 } from "../validation";
 
 const TEST_CHANNEL_NAME = "test";
@@ -85,6 +85,9 @@ async function routeTestChannelRequest(request: Request, env: Env) {
         "POST /api/test-channel/stop",
         "GET /api/test-channel/approvals?chatId=default",
         "GET /api/test-channel/state",
+        "GET|PUT|DELETE /api/test-channel/llm",
+        "POST /api/test-channel/llm/active",
+        "POST /api/test-channel/llm/test",
       ],
     });
   }
@@ -122,12 +125,27 @@ async function routeTestChannelRequest(request: Request, env: Env) {
     return fetchAgentObject(env, request.url, "/state", { method: "GET" });
   }
 
+  if (
+    ["GET", "PUT", "DELETE"].includes(request.method) &&
+    url.pathname.endsWith("/llm")
+  ) {
+    return proxyJsonAgentEndpoint(request, env, "/settings/llm");
+  }
+
+  if (request.method === "POST" && url.pathname.endsWith("/llm/active")) {
+    return proxyJsonAgentEndpoint(request, env, "/settings/llm/active");
+  }
+
+  if (request.method === "POST" && url.pathname.endsWith("/llm/test")) {
+    return proxyJsonAgentEndpoint(request, env, "/settings/llm/test");
+  }
+
   return Response.json({ ok: false, error: "Unknown test channel endpoint." }, { status: 404 });
 }
 
 async function handleTestChat(request: Request, env: Env) {
   const payload = await parseJsonBody(request, TestChatRequestSchema);
-  const llm = resolveRequiredLlm(payload, env);
+  const llm = await resolveRequiredChannelLlm(env, request.url, payload.llm, "test channel");
   if (llm instanceof Error) {
     return Response.json({ ok: false, error: llm.message }, { status: 400 });
   }
@@ -148,7 +166,7 @@ async function handleTestChat(request: Request, env: Env) {
 
 async function handleTestApprove(request: Request, env: Env, approvalId: string) {
   const payload = await parseJsonBody(request, TestApprovalRequestSchema);
-  const llm = resolveOptionalLlm(payload, env);
+  const llm = await resolveOptionalChannelLlm(env, request.url, payload.llm);
   const response = await fetchAgentObject(
     env,
     request.url,
@@ -193,6 +211,23 @@ async function handleTestStop(request: Request, env: Env) {
   });
 }
 
+async function proxyJsonAgentEndpoint(request: Request, env: Env, pathname: string) {
+  const headers =
+    request.method === "GET" || request.method === "DELETE"
+      ? undefined
+      : { "Content-Type": request.headers.get("Content-Type") ?? "application/json" };
+  const body =
+    request.method === "GET" || request.method === "DELETE"
+      ? undefined
+      : await request.text();
+
+  return fetchAgentObject(env, request.url, pathname, {
+    method: request.method,
+    headers,
+    body,
+  });
+}
+
 async function parseJsonBody<T extends z.ZodType>(
   request: Request,
   schema: T,
@@ -202,16 +237,6 @@ async function parseJsonBody<T extends z.ZodType>(
     throw new Error(formatZodError(result.error));
   }
   return result.data;
-}
-
-function resolveRequiredLlm(payload: Pick<TestChatRequest, "llm">, env: Env) {
-  return payload.llm ?? parseServerLlmEnv(env, "test channel");
-}
-
-function resolveOptionalLlm(payload: Pick<TestApprovalRequest, "llm">, env: Env) {
-  if (payload.llm) return payload.llm;
-  const llm = parseServerLlmEnv(env, "test channel");
-  return llm instanceof Error ? undefined : llm;
 }
 
 async function maybeJsonAgentStream(

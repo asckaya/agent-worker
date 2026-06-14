@@ -85,9 +85,123 @@ describe("UserAgentObject run state", () => {
     const finalState = await object.fetch(new Request("https://agent.test/state"));
     await expect(finalState.json()).resolves.toMatchObject({ activeRuns: [] });
   });
+
+  it("stores bounded non-secret LLM profiles and resolves key availability from env", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql, { OPENROUTER_API_KEY: "secret-key" } as Partial<Env>);
+
+    const update = await object.fetch(
+      jsonRequest(
+        "/settings/llm",
+        {
+          activeProfileId: "openrouter",
+          profiles: [
+            {
+              id: "openrouter",
+              name: "OpenRouter",
+              baseUrl: "https://openrouter.ai/api/v1",
+              model: "google/gemma-4-31b-it:free",
+              apiKeyEnv: "OPENROUTER_API_KEY",
+              maxTokens: 8192,
+            },
+          ],
+        },
+        "PUT",
+      ),
+    );
+
+    expect(update.status).toBe(200);
+    await expect(update.json()).resolves.toMatchObject({
+      ok: true,
+      source: "stored",
+      summary: {
+        activeProfileId: "openrouter",
+        profiles: [
+          {
+            id: "openrouter",
+            apiKeyEnv: "OPENROUTER_API_KEY",
+            hasApiKey: true,
+          },
+        ],
+      },
+    });
+    expect(sql.runtimeSettings[0]?.value_json).toContain("OPENROUTER_API_KEY");
+    expect(sql.runtimeSettings[0]?.value_json).not.toContain("secret-key");
+
+    const state = await object.fetch(new Request("https://agent.test/state"));
+    await expect(state.json()).resolves.toMatchObject({
+      llm: {
+        source: "stored",
+        activeProfileId: "openrouter",
+        profiles: [{ id: "openrouter", hasApiKey: true }],
+      },
+    });
+  });
+
+  it("reads non-secret LLM profiles from LLM_PROFILES_JSON env", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql, {
+      LLM_PROFILES_JSON: JSON.stringify({
+        activeProfileId: "openrouter",
+        profiles: [
+          {
+            id: "openrouter",
+            baseUrl: "https://openrouter.ai/api/v1",
+            model: "google/gemma-4-31b-it:free",
+            apiKeyEnv: "OPENROUTER_API_KEY",
+          },
+        ],
+      }),
+      OPENROUTER_API_KEY: "secret-key",
+    } as Partial<Env>);
+
+    const response = await object.fetch(new Request("https://agent.test/settings/llm"));
+
+    expect(sql.runtimeSettings).toHaveLength(0);
+    await expect(response.json()).resolves.toMatchObject({
+      ok: true,
+      source: "env",
+      summary: {
+        activeProfileId: "openrouter",
+        profiles: [{ id: "openrouter", hasApiKey: true }],
+      },
+    });
+  });
+
+  it("rejects secret-bearing LLM extra headers", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql);
+
+    const response = await object.fetch(
+      jsonRequest(
+        "/settings/llm",
+        {
+          activeProfileId: "bad",
+          profiles: [
+            {
+              id: "bad",
+              baseUrl: "https://api.example.test/v1",
+              model: "example-model",
+              apiKeyEnv: "LLM_API_KEY",
+              extraHeaders: {
+                Authorization: "Bearer should-not-be-stored",
+              },
+            },
+          ],
+        },
+        "PUT",
+      ),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: expect.stringContaining("Use apiKeyEnv for secret-bearing headers."),
+    });
+    expect(sql.runtimeSettings).toHaveLength(0);
+  });
 });
 
-function createObject(sql: FakeSqlStorage) {
+function createObject(sql: FakeSqlStorage, env: Partial<Env> = {}) {
   const ctx = {
     storage: { sql },
     waitUntil(promise: Promise<unknown>) {
@@ -95,7 +209,7 @@ function createObject(sql: FakeSqlStorage) {
     },
   } as unknown as DurableObjectState;
 
-  return new UserAgentObject(ctx, {} as Env);
+  return new UserAgentObject(ctx, env as Env);
 }
 
 function chatRequest(message: string) {
@@ -114,9 +228,9 @@ function approveRequest(approvalId: string) {
   });
 }
 
-function jsonRequest(path: string, body: unknown) {
+function jsonRequest(path: string, body: unknown, method = "POST") {
   return new Request(`https://agent.test${path}`, {
-    method: "POST",
+    method,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
@@ -276,9 +390,16 @@ interface PendingApprovalRow {
   expires_at: number;
 }
 
+interface RuntimeSettingRow {
+  key: string;
+  value_json: string;
+  updated_at: number;
+}
+
 class FakeSqlStorage {
   readonly memories: StoredMemory[] = [];
   readonly pendingApprovals: PendingApprovalRow[] = [];
+  readonly runtimeSettings: RuntimeSettingRow[] = [];
 
   exec(sql: string, ...bindings: Array<string | number | null>) {
     const normalized = sql.replace(/\s+/g, " ").trim();
@@ -319,6 +440,31 @@ class FakeSqlStorage {
         .slice()
         .sort((left, right) => right.created_at - left.created_at)
         .map(({ id }) => ({ id }));
+    }
+
+    if (normalized.startsWith("INSERT INTO runtime_settings")) {
+      const [key, valueJson, updatedAt] = bindings;
+      const existing = this.runtimeSettings.find((setting) => setting.key === key);
+      if (existing) {
+        existing.value_json = String(valueJson);
+        existing.updated_at = Number(updatedAt);
+      } else {
+        this.runtimeSettings.push({
+          key: String(key),
+          value_json: String(valueJson),
+          updated_at: Number(updatedAt),
+        });
+      }
+      return [];
+    }
+
+    if (normalized.startsWith("SELECT key, value_json, updated_at FROM runtime_settings WHERE key = ?")) {
+      return this.runtimeSettings.filter((setting) => setting.key === bindings[0]).slice(0, 1);
+    }
+
+    if (normalized === "DELETE FROM runtime_settings WHERE key = ?") {
+      this.deleteRows(this.runtimeSettings, (setting) => setting.key === bindings[0]);
+      return [];
     }
 
     if (normalized.startsWith("INSERT INTO pending_approvals")) {

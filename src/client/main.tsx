@@ -89,9 +89,9 @@ function App() {
           <ul>
             <li>No web chat UI is exposed.</li>
             <li>Telegram messages are not stored as conversation history.</li>
-            <li>Durable Object SQLite persists bounded memory and short-lived approvals only.</li>
+            <li>Durable Object SQLite persists bounded memory, short-lived approvals, and non-secret LLM profile overrides.</li>
             <li>Active runs, approval continuations, paused approvals, and queued follow-ups are process-memory state.</li>
-            <li>LLM credentials for Telegram are Worker secrets/env vars.</li>
+            <li>LLM credentials for Telegram stay in Worker secrets/env vars.</li>
             <li>Admin APIs remain protected by signed cookie auth.</li>
           </ul>
         </article>

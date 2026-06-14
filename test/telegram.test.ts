@@ -961,11 +961,19 @@ function webhookRequest(body: unknown) {
   });
 }
 
-function agentNamespace(fetchImpl: (request: Request) => Promise<Response>) {
+function agentNamespace(
+  fetchImpl: (request: Request) => Promise<Response>,
+  llmSettingsResponse: unknown = { ok: true, settings: null },
+) {
   return {
     idFromName: vi.fn(() => "agent-id"),
     get: vi.fn(() => ({
-      fetch: fetchImpl,
+      fetch: async (request: Request) => {
+        if (new URL(request.url).pathname === "/settings/llm") {
+          return Response.json(llmSettingsResponse);
+        }
+        return fetchImpl(request);
+      },
     })),
   } as unknown as DurableObjectNamespace;
 }

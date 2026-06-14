@@ -52,6 +52,10 @@ describe("test channel", () => {
   it("uses server-side LLM env when chat payload omits llm", async () => {
     let agentBody = {};
     const agentFetch = vi.fn(async (request: Request) => {
+      if (new URL(request.url).pathname === "/settings/llm") {
+        return Response.json({ ok: true, settings: null });
+      }
+
       agentBody = await request.json();
       return new Response(sseStream([["done", { content: "ok" }]]), {
         headers: { "Content-Type": "text/event-stream" },
@@ -112,17 +116,75 @@ describe("test channel", () => {
   });
 
   it("requires LLM config for chat when env is not configured", async () => {
+    const agentFetch = vi.fn(async (request: Request) => {
+      if (new URL(request.url).pathname === "/settings/llm") {
+        return Response.json({ ok: true, settings: null });
+      }
+
+      throw new Error("Unexpected agent call.");
+    });
+
     const response = await handleTestChannelRequest(
       jsonRequest("/api/test-channel/chat", {
         message: "hello",
       }),
-      env({ AGENT_OBJECT: agentNamespace(vi.fn()) }),
+      env({ AGENT_OBJECT: agentNamespace(agentFetch) }),
     );
 
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toEqual({
       ok: false,
       error: "LLM_BASE_URL, LLM_API_KEY, and LLM_MODEL are required for test channel.",
+    });
+  });
+
+  it("uses stored LLM profile settings before server-side fallback env", async () => {
+    let agentBody = {};
+    const agentFetch = vi.fn(async (request: Request) => {
+      const path = new URL(request.url).pathname;
+      if (path === "/settings/llm") {
+        return Response.json({
+          ok: true,
+          settings: {
+            activeProfileId: "openrouter",
+            profiles: [
+              {
+                id: "openrouter",
+                baseUrl: "https://openrouter.ai/api/v1",
+                model: "google/gemma-4-31b-it:free",
+                apiKeyEnv: "OPENROUTER_API_KEY",
+              },
+            ],
+          },
+        });
+      }
+
+      agentBody = await request.json();
+      return new Response(sseStream([["done", { content: "ok" }]]), {
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    });
+
+    const response = await handleTestChannelRequest(
+      jsonRequest("/api/test-channel/chat?format=json", {
+        message: "hello",
+      }),
+      env({
+        AGENT_OBJECT: agentNamespace(agentFetch),
+        LLM_BASE_URL: "https://api.openai.com/v1",
+        LLM_API_KEY: "env-key",
+        LLM_MODEL: "env-model",
+        OPENROUTER_API_KEY: "stored-key",
+      } as Partial<Env>),
+    );
+
+    expect(response.status).toBe(200);
+    expect(agentBody).toMatchObject({
+      llm: {
+        baseUrl: "https://openrouter.ai/api/v1",
+        apiKey: "stored-key",
+        model: "google/gemma-4-31b-it:free",
+      },
     });
   });
 });

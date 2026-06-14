@@ -15,6 +15,9 @@ LLM_API_KEY=
 LLM_MODEL=gpt-4.1-mini
 LLM_TEMPERATURE=0.7
 LLM_MAX_TOKENS=1200
+# Optional multi-profile config. This stores only non-secret profile metadata.
+# API keys stay in variables/secrets named by each profile's apiKeyEnv.
+LLM_PROFILES_JSON=
 
 # Optional: raises GitHub API rate limits for GitHub tools.
 GITHUB_TOKEN=
