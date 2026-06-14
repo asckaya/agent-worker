@@ -129,9 +129,10 @@ bun run test
 bun run test:coverage
 bun run test:full
 bun run build
+bun run deploy:dry-run
 ```
 
-`bun run test:coverage` runs the Vitest suite with V8 coverage and writes HTML/lcov reports under `coverage/`. `bun run test:full` runs typecheck, tests, and the Wrangler dry-run build. `bun run build` performs a Wrangler dry-run build and writes Wrangler config/log state under `.wrangler-home` inside the project.
+`bun run build` runs typecheck and builds the status-page assets, which is the right command for Cloudflare Git builds. `bun run deploy:dry-run` additionally runs the Wrangler dry-run build and writes Wrangler config/log state under `.wrangler-home` inside the project. `bun run test:coverage` runs the Vitest suite with V8 coverage and writes HTML/lcov reports under `coverage/`. `bun run test:full` runs tests plus the Wrangler dry-run build.
 
 Current tests cover zod validation schemas, cookies, top-level Worker route/auth/assets boundaries, Cloudflare runtime-boundary checks, context assembly, memory search helpers, zod-backed basic/research/GitHub/web/memory tools, tool registry/executor/guardrails, Durable Object approval/follow-up state, HTTP test channel proxying, channel command/SSE/registry helpers, OpenAI-compatible AI SDK streaming/tool calls, Telegram webhook auth paths, Telegram draft streaming, text batching, edit fallback and flood-control fallback, MarkdownV2 plain fallback, stale preview cleanup, inline approval callbacks, active-run stop commands, and command admin policy.
 

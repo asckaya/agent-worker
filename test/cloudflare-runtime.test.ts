@@ -40,7 +40,8 @@ describe("Cloudflare runtime boundary", () => {
     };
 
     expect(pkg.scripts?.dev).toContain("wrangler dev");
-    expect(pkg.scripts?.build).toContain("wrangler deploy --dry-run");
+    expect(pkg.scripts?.build).not.toContain("wrangler deploy");
+    expect(pkg.scripts?.["deploy:dry-run"]).toContain("wrangler deploy --dry-run");
     expect(Object.values(pkg.scripts ?? {}).join("\n")).not.toMatch(
       /\b(Bun\.serve|deno serve|next dev|next build|node --watch|tsx watch)\b/,
     );

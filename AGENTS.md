@@ -65,10 +65,11 @@ bun install
 bun run typecheck
 bun run test
 bun run build
+bun run deploy:dry-run
 bun run dev
 ```
 
-`bun run build` performs a Wrangler dry-run build. `bun run dev` starts Wrangler dev and may need elevated permissions in restricted sandboxes because Wrangler reads local network interfaces.
+`bun run build` runs typecheck and builds the status-page assets for Cloudflare Git builds. `bun run deploy:dry-run` performs a Wrangler dry-run build. `bun run dev` starts Wrangler dev and may need elevated permissions in restricted sandboxes because Wrangler reads local network interfaces.
 
 ## Files To Know
 

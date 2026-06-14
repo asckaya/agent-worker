@@ -6,12 +6,13 @@
   "packageManager": "bun@1.3.13",
   "scripts": {
     "dev": "bun run build:client && CI=1 HOME=.wrangler-home wrangler dev",
-    "build": "bun run typecheck && bun run build:client && CI=1 HOME=.wrangler-home wrangler deploy --dry-run --outdir dist/worker",
+    "build": "bun run typecheck && bun run build:client",
     "build:client": "vite build",
+    "deploy:dry-run": "bun run build && CI=1 HOME=.wrangler-home wrangler deploy --dry-run --outdir dist/worker",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "test:full": "bun run test && bun run build"
+    "test:full": "bun run test && bun run deploy:dry-run"
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "latest",
