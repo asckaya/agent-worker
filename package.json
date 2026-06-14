@@ -9,12 +9,16 @@
     "build": "bun run typecheck && bun run build:client && CI=1 HOME=.wrangler-home wrangler deploy --dry-run --outdir dist/worker",
     "build:client": "vite build",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:full": "bun run test && bun run build"
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "latest",
+    "@octokit/request": "latest",
     "@vitejs/plugin-react": "latest",
     "ai": "latest",
+    "fast-xml-parser": "latest",
     "hono": "latest",
     "react": "latest",
     "react-dom": "latest",
@@ -26,6 +30,7 @@
     "@types/node": "latest",
     "@types/react": "latest",
     "@types/react-dom": "latest",
+    "@vitest/coverage-v8": "latest",
     "typescript": "latest",
     "vitest": "latest",
     "wrangler": "latest"

@@ -15,6 +15,7 @@ export interface ToolAvailabilityContext {
 
 export interface ToolContext {
   fetch: typeof fetch;
+  env?: Env;
   saveMemory: (content: string) => Promise<void>;
   searchMemory: (query: string) => Promise<string[]>;
 }

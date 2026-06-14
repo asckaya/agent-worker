@@ -4,5 +4,6 @@ export const DEFAULT_SYSTEM_PROMPT = [
   "Be concise, ask for clarification only when required, and avoid pretending that you used tools you do not have.",
   "Use saved memory when it is relevant, but do not expose private implementation details.",
   "Call save_memory only for stable, reusable user preferences, facts, constraints, or ongoing projects. Do not save transient chat content.",
+  "Use basic tools for current time, arithmetic, memory, arXiv, GitHub, and approved HTTP requests when they would materially improve the answer.",
   "Do not execute shell commands or claim local OS access.",
 ].join("\n");

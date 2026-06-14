@@ -13,7 +13,7 @@ const checks = [
   { label: "State", value: "DO SQLite bounded memory + in-memory run control" },
   { label: "Channel", value: "Telegram + protected HTTP test channel" },
   { label: "Model", value: "Vercel AI SDK + OpenAI-compatible adapter" },
-  { label: "Tools", value: "zod registry + approval-aware executor + guardrails" },
+  { label: "Tools", value: "basic + arXiv/GitHub + approval-gated HTTP" },
 ];
 
 function App() {

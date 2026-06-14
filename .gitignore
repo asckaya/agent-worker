@@ -2,6 +2,7 @@ node_modules/
 dist/
 .wrangler/
 .wrangler-home/
+coverage/
 .dev.vars
 *.local
 reference/*.tar.gz

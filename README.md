@@ -13,6 +13,20 @@ The runtime is split into `model / tool / channel` layers. Telegram is the first
 - Telegram uses server-side LLM env vars because it has no browser-local key store.
 - Memory is capped at 200 items and 1200 characters per item.
 
+## Tooling
+
+Default tools are intentionally Worker-native and bounded:
+
+- `current_time`: current date/time with optional timezone.
+- `calculate`: arithmetic expression evaluator without code execution.
+- `arxiv_search`: arXiv paper search through the public arXiv API.
+- `github_search_repositories`, `github_get_repository`, `github_read_file`: public GitHub repository and file reading via Octokit. Optional `GITHUB_TOKEN` raises GitHub API rate limits.
+- `fetch_url`: simple bounded URL read, requires approval.
+- `http_request`: curl-like HTTP request with method/header/body support, requires approval.
+- `save_memory` and `search_memory`: bounded curated memory tools.
+
+External HTTP tools require `/approve` or an inline Telegram approval before execution. There is no shell/bash execution in the Worker runtime.
+
 ## Auth Boundary
 
 `ADMIN_TOKEN` protects `/api/agent/*` admin/API routes and `/api/test-channel/*`. The status page and `/api/health` are public. A Worker URL is public, so protected agent APIs prevent other people from reading/writing memory or spending your LLM quota through your deployment. Protected routes accept either the signed login cookie or `Authorization: Bearer $ADMIN_TOKEN` for curl-based testing.
@@ -112,12 +126,14 @@ Approval and control endpoints:
 ```bash
 bun run typecheck
 bun run test
+bun run test:coverage
+bun run test:full
 bun run build
 ```
 
-`bun run build` performs a Wrangler dry-run build and writes Wrangler config/log state under `.wrangler-home` inside the project.
+`bun run test:coverage` runs the Vitest suite with V8 coverage and writes HTML/lcov reports under `coverage/`. `bun run test:full` runs typecheck, tests, and the Wrangler dry-run build. `bun run build` performs a Wrangler dry-run build and writes Wrangler config/log state under `.wrangler-home` inside the project.
 
-Current tests cover zod validation schemas, cookies, context assembly, memory search helpers, zod-backed tool registry/executor/guardrails, Durable Object approval/follow-up state, HTTP test channel proxying, channel command/SSE/registry helpers, OpenAI-compatible AI SDK streaming/tool calls, Telegram webhook auth paths, Telegram draft streaming, text batching, edit fallback and flood-control fallback, MarkdownV2 plain fallback, stale preview cleanup, inline approval callbacks, active-run stop commands, and command admin policy.
+Current tests cover zod validation schemas, cookies, top-level Worker route/auth/assets boundaries, Cloudflare runtime-boundary checks, context assembly, memory search helpers, zod-backed basic/research/GitHub/web/memory tools, tool registry/executor/guardrails, Durable Object approval/follow-up state, HTTP test channel proxying, channel command/SSE/registry helpers, OpenAI-compatible AI SDK streaming/tool calls, Telegram webhook auth paths, Telegram draft streaming, text batching, edit fallback and flood-control fallback, MarkdownV2 plain fallback, stale preview cleanup, inline approval callbacks, active-run stop commands, and command admin policy.
 
 ## Docs
 

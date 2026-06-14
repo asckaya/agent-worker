@@ -1305,7 +1305,7 @@ export class UserAgentObject {
 
   private createToolContext(): ToolContext {
     return {
-      fetch,
+      fetch: (input, init) => fetch(input, init),
       saveMemory: async (content) => {
         this.saveMemory(content);
       },

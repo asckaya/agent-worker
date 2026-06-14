@@ -14,6 +14,7 @@ export interface Env {
   LLM_MODEL?: string;
   LLM_TEMPERATURE?: string;
   LLM_MAX_TOKENS?: string;
+  GITHUB_TOKEN?: string;
 }
 
 export type ChatRole = "system" | "user" | "assistant" | "tool";

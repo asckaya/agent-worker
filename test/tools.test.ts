@@ -1,8 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { createDefaultToolRegistry } from "../src/worker/tools";
+import { arxivSearchTool } from "../src/worker/tools/arxiv";
+import { calculateTool, currentTimeTool } from "../src/worker/tools/basic";
 import { capToolResult, ToolExecutor } from "../src/worker/tools/executor";
 import { fetchUrlTool } from "../src/worker/tools/fetch-url";
+import {
+  githubGetRepositoryTool,
+  githubReadFileTool,
+  githubSearchRepositoriesTool,
+} from "../src/worker/tools/github";
+import { httpRequestTool } from "../src/worker/tools/http-request";
 import {
   stableJsonStringify,
   ToolLoopRecovery,
@@ -15,7 +23,14 @@ describe("tool registry", () => {
   it("registers default tools for the model", () => {
     const tools = createDefaultToolRegistry().listModelTools();
     expect(tools.map((tool) => tool.function.name).sort()).toEqual([
+      "arxiv_search",
+      "calculate",
+      "current_time",
       "fetch_url",
+      "github_get_repository",
+      "github_read_file",
+      "github_search_repositories",
+      "http_request",
       "save_memory",
       "search_memory",
     ]);
@@ -30,6 +45,10 @@ describe("tool registry", () => {
       "Requires explicit user approval",
     );
     expect(createDefaultToolRegistry().get("fetch_url")?.toolset).toBe("web");
+    expect(createDefaultToolRegistry().get("http_request")?.toolset).toBe("web");
+    expect(createDefaultToolRegistry().get("calculate")?.toolset).toBe("basic");
+    expect(createDefaultToolRegistry().get("arxiv_search")?.toolset).toBe("research");
+    expect(createDefaultToolRegistry().get("github_search_repositories")?.toolset).toBe("github");
     expect(createDefaultToolRegistry().get("save_memory")?.toolset).toBe("memory");
   });
 
@@ -276,3 +295,303 @@ describe("fetch_url tool", () => {
     expect(fetchUrlTool.inputSchema.safeParse({ url: "not-a-url" }).success).toBe(false);
   });
 });
+
+describe("http_request tool", () => {
+  it("performs bounded curl-like HTTP requests", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ ok: true }), {
+        status: 201,
+        statusText: "Created",
+        headers: { "Content-Type": "application/json", "X-Test": "yes" },
+      }),
+    );
+
+    const result = await httpRequestTool.execute(
+      {
+        fetch: fetchMock as typeof fetch,
+        saveMemory: async () => undefined,
+        searchMemory: async () => [],
+      },
+      {
+        url: "https://api.example.com/items",
+        method: "POST",
+        headers: [{ name: "Content-Type", value: "application/json" }],
+        body: "{\"name\":\"demo\"}",
+      },
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith("https://api.example.com/items", {
+      method: "POST",
+      headers: expect.any(Headers),
+      body: "{\"name\":\"demo\"}",
+      redirect: "follow",
+    });
+    expect(result).toMatchObject({
+      url: "https://api.example.com/items",
+      method: "POST",
+      status: 201,
+      statusText: "Created",
+      ok: true,
+      contentType: "application/json",
+      json: { ok: true },
+      text: "{\"ok\":true}",
+      truncated: false,
+    });
+    expect(result.headers["content-type"]).toBe("application/json");
+  });
+
+  it("rejects unsafe request shapes", async () => {
+    await expect(
+      httpRequestTool.execute(
+        {
+          fetch,
+          saveMemory: async () => undefined,
+          searchMemory: async () => [],
+        },
+        {
+          url: "file:///etc/passwd",
+          method: "GET",
+          headers: [],
+        },
+      ),
+    ).rejects.toThrow("Only http and https URLs are supported.");
+
+    await expect(
+      httpRequestTool.execute(
+        {
+          fetch,
+          saveMemory: async () => undefined,
+          searchMemory: async () => [],
+        },
+        {
+          url: "https://example.com",
+          method: "GET",
+          headers: [{ name: "Host", value: "evil.example" }],
+        },
+      ),
+    ).rejects.toThrow("Header is not allowed: Host");
+  });
+});
+
+describe("basic tools", () => {
+  it("evaluates arithmetic without code execution", async () => {
+    await expect(
+      calculateTool.execute(
+        {
+          fetch,
+          saveMemory: async () => undefined,
+          searchMemory: async () => [],
+        },
+        { expression: "sqrt(16) + max(2, 3) * 4 - 2^3" },
+      ),
+    ).resolves.toEqual({
+      expression: "sqrt(16) + max(2, 3) * 4 - 2^3",
+      result: 8,
+    });
+    await expect(
+      calculateTool.execute(
+        {
+          fetch,
+          saveMemory: async () => undefined,
+          searchMemory: async () => [],
+        },
+        { expression: "unknown(1)" },
+      ),
+    ).rejects.toThrow("Unknown function");
+  });
+
+  it("formats current time for a timezone", async () => {
+    const result = await currentTimeTool.execute(
+      {
+        fetch,
+        saveMemory: async () => undefined,
+        searchMemory: async () => [],
+      },
+      { timeZone: "UTC" },
+    );
+
+    expect(result.iso).toEqual(expect.any(String));
+    expect(result.unixMs).toEqual(expect.any(Number));
+    expect(result.timeZone).toBe("UTC");
+    expect(result.formatted).toEqual(expect.any(String));
+  });
+
+});
+
+describe("arxiv tool", () => {
+  it("parses arXiv Atom search results with fast-xml-parser", async () => {
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL) =>
+        new Response(
+        `<?xml version="1.0"?>
+        <feed xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
+          <opensearch:totalResults>12</opensearch:totalResults>
+          <entry>
+            <id>http://arxiv.org/abs/2401.00001v1</id>
+            <updated>2024-01-02T00:00:00Z</updated>
+            <published>2024-01-01T00:00:00Z</published>
+            <title> Test Paper &amp; Results </title>
+            <summary> A paper about useful agent tooling. </summary>
+            <author><name>Alice Example</name></author>
+            <author><name>Bob Example</name></author>
+            <category term="cs.AI" />
+            <link href="http://arxiv.org/abs/2401.00001v1" rel="alternate" type="text/html" />
+            <link title="pdf" href="http://arxiv.org/pdf/2401.00001v1" rel="related" type="application/pdf" />
+          </entry>
+        </feed>`,
+        ),
+    );
+
+    await expect(
+      arxivSearchTool.execute(
+        {
+          fetch: fetchMock as typeof fetch,
+          saveMemory: async () => undefined,
+          searchMemory: async () => [],
+        },
+        { query: "agent tooling", maxResults: 1, sortBy: "relevance", sortOrder: "descending" },
+      ),
+    ).resolves.toEqual({
+      query: "agent tooling",
+      totalResults: 12,
+      entries: [
+        {
+          id: "http://arxiv.org/abs/2401.00001v1",
+          title: "Test Paper & Results",
+          authors: ["Alice Example", "Bob Example"],
+          summary: "A paper about useful agent tooling.",
+          published: "2024-01-01T00:00:00Z",
+          updated: "2024-01-02T00:00:00Z",
+          categories: ["cs.AI"],
+          pdfUrl: "http://arxiv.org/pdf/2401.00001v1",
+          absUrl: "http://arxiv.org/abs/2401.00001v1",
+        },
+      ],
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("export.arxiv.org/api/query");
+  });
+});
+
+describe("github tools", () => {
+  it("searches repositories through Octokit request", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      expect(requestUrl(input)).toContain("https://api.github.com/search/repositories");
+      return Response.json({
+        total_count: 1,
+        incomplete_results: false,
+        items: [githubRepoApiResponse()],
+      });
+    });
+
+    await expect(
+      githubSearchRepositoriesTool.execute(
+        {
+          fetch: fetchMock as typeof fetch,
+          env: { GITHUB_TOKEN: "token" } as never,
+          saveMemory: async () => undefined,
+          searchMemory: async () => [],
+        },
+        { query: "agent worker", maxResults: 1, sort: "stars", order: "desc" },
+      ),
+    ).resolves.toMatchObject({
+      query: "agent worker",
+      totalCount: 1,
+      incompleteResults: false,
+      items: [
+        {
+          fullName: "cloudflare/workers-sdk",
+          stars: 123,
+          language: "TypeScript",
+        },
+      ],
+    });
+    expect(readHeader(fetchMock.mock.calls[0]?.[1]?.headers, "authorization")).toBe("Bearer token");
+  });
+
+  it("gets repository metadata through Octokit request", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      expect(requestUrl(input)).toBe("https://api.github.com/repos/cloudflare/workers-sdk");
+      return Response.json(githubRepoApiResponse());
+    });
+
+    await expect(
+      githubGetRepositoryTool.execute(
+        {
+          fetch: fetchMock as typeof fetch,
+          saveMemory: async () => undefined,
+          searchMemory: async () => [],
+        },
+        { owner: "cloudflare", repo: "workers-sdk" },
+      ),
+    ).resolves.toMatchObject({
+      fullName: "cloudflare/workers-sdk",
+      htmlUrl: "https://github.com/cloudflare/workers-sdk",
+      defaultBranch: "main",
+    });
+  });
+
+  it("reads repository files through Octokit request", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      expect(requestUrl(input)).toBe(
+        "https://api.github.com/repos/cloudflare/workers-sdk/contents/README.md",
+      );
+      return Response.json({
+        type: "file",
+        path: "README.md",
+        size: 12,
+        encoding: "base64",
+        content: btoa("Hello README"),
+        download_url: "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/README.md",
+        html_url: "https://github.com/cloudflare/workers-sdk/blob/main/README.md",
+      });
+    });
+
+    await expect(
+      githubReadFileTool.execute(
+        {
+          fetch: fetchMock as typeof fetch,
+          saveMemory: async () => undefined,
+          searchMemory: async () => [],
+        },
+        { owner: "cloudflare", repo: "workers-sdk", path: "README.md" },
+      ),
+    ).resolves.toEqual({
+      repository: "cloudflare/workers-sdk",
+      path: "README.md",
+      ref: undefined,
+      htmlUrl: "https://github.com/cloudflare/workers-sdk/blob/main/README.md",
+      downloadUrl: "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/README.md",
+      size: 12,
+      truncated: false,
+      text: "Hello README",
+    });
+  });
+});
+
+function requestUrl(input: RequestInfo | URL) {
+  return input instanceof Request ? input.url : String(input);
+}
+
+function readHeader(headers: HeadersInit | undefined, name: string) {
+  if (!headers) return undefined;
+  return new Headers(headers).get(name);
+}
+
+function githubRepoApiResponse() {
+  return {
+    full_name: "cloudflare/workers-sdk",
+    name: "workers-sdk",
+    owner: { login: "cloudflare" },
+    description: "Cloudflare Workers SDK",
+    html_url: "https://github.com/cloudflare/workers-sdk",
+    stargazers_count: 123,
+    forks_count: 10,
+    open_issues_count: 5,
+    language: "TypeScript",
+    topics: ["workers"],
+    license: { spdx_id: "MIT", name: "MIT License" },
+    default_branch: "main",
+    updated_at: "2024-01-01T00:00:00Z",
+    pushed_at: "2024-01-02T00:00:00Z",
+  };
+}

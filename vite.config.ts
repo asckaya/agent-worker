@@ -11,5 +11,12 @@ export default defineConfig({
   test: {
     root: ".",
     include: ["test/**/*.test.ts"],
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "html", "lcov"],
+      reportsDirectory: "coverage",
+      include: ["src/**/*.{ts,tsx}"],
+      exclude: ["src/client/vite-env.d.ts"],
+    },
   },
 });

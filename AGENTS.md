@@ -54,7 +54,7 @@ Guidance for coding agents working in this repository.
 - Active Telegram runs, approval continuation runs, paused approval sessions, and queued follow-ups are process-memory control state only. Do not add persisted transcript/session tables to implement `/stop`, `/new`, `/reset`, approval continuation, or follow-up queueing.
 - The active-run follow-up queue interrupts the current model step and resumes with ephemeral in-run model context. Paused approval continuation can collect supplemental user messages while waiting for `/approve` or `/deny`. Neither path may write user messages, assistant replies, raw tool transcript, or LLM keys to SQLite.
 - Each agent turn has a max tool step limit.
-- High-risk tools should require approval before execution.
+- High-risk or arbitrary external-network tools should require approval before execution. Current arbitrary HTTP tools (`fetch_url`, `http_request`) are approval-gated; fixed public read-only tools (`arxiv_search`, GitHub tools) and local tools (`current_time`, `calculate`) are not.
 - Duplicate pending approvals for the same channel/chat/tool/input should be reused while unexpired.
 - Tool results should respect tool-level `maxResultChars` before being returned to the model.
 

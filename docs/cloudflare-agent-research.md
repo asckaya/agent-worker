@@ -273,7 +273,12 @@ Sandbox 基于 Cloudflare Containers。
 - Active run、approval continuation run、paused approval session 和 follow-up queue 只放 Durable Object 进程内存，不写完整聊天历史。
 - `/approve <id>` / `/deny <id>` 工具审批；pending approval 只保存工具名、工具输入、channel/chat id 和过期时间。
 - 工具注册表：
+  - `current_time`
+  - `calculate`
+  - `arxiv_search`
+  - GitHub tools via Octokit request
   - `fetch_url`，需要 approval。
+  - `http_request`，curl-like，需要 approval。
   - `save_memory`
   - `search_memory`
 - AI SDK 处理 OpenAI-compatible streaming/tool call 解析。
