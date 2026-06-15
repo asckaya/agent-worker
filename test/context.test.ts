@@ -27,4 +27,15 @@ describe("agent context", () => {
     expect(messages[1]?.content).not.toContain("memory 8");
     expect(messages.at(-1)).toEqual({ role: "user", content: "What should I remember?" });
   });
+
+  it("does not trim chat history before sending model context", () => {
+    const history = Array.from({ length: 30 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" as const : "assistant" as const,
+      content: `message ${index}`,
+    }));
+
+    const messages = buildModelMessages(history, []);
+
+    expect(messages.slice(1)).toEqual(history);
+  });
 });

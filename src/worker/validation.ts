@@ -5,6 +5,7 @@ const MAX_MESSAGE_CHARS = 16_000;
 const MAX_HISTORY_MESSAGES = 24;
 const MAX_EXTRA_HEADERS = 10;
 const MAX_TASK_TITLE_CHARS = 1_200;
+const MAX_SESSION_TITLE_CHARS = 200;
 const MAX_MEMORY_INPUT_CHARS = 16_000;
 const MAX_CHAT_ATTACHMENTS = 4;
 const MAX_ATTACHMENT_DATA_CHARS = 8 * 1024 * 1024;
@@ -68,6 +69,7 @@ export const ChatRequestSchema = z.object({
       chatId: nonEmptyString.max(128),
     })
     .optional(),
+  sessionId: nonEmptyString.max(64).optional(),
 });
 
 export const ChannelSourceSchema = z.object({
@@ -82,6 +84,17 @@ export const ApprovalActionRequestSchema = z.object({
 
 export const SessionControlRequestSchema = z.object({
   source: ChannelSourceSchema.optional(),
+  resetConversation: z.boolean().optional().default(false),
+});
+
+export const ChatSessionCreateRequestSchema = z.object({
+  source: ChannelSourceSchema,
+  title: z.string().trim().max(MAX_SESSION_TITLE_CHARS).optional(),
+});
+
+export const ChatSessionSwitchRequestSchema = z.object({
+  source: ChannelSourceSchema,
+  sessionId: nonEmptyString.max(64),
 });
 
 export const MemoryCreateRequestSchema = z.object({
@@ -200,10 +213,33 @@ export function parseApprovalActionPayload(payload: unknown): {
 
 export function parseSessionControlPayload(payload: unknown): {
   source?: ChannelSource;
+  resetConversation: boolean;
 } {
   const result = SessionControlRequestSchema.safeParse(payload);
   if (!result.success) {
     throw new Error(formatZodError("Invalid session control request", result.error));
+  }
+  return result.data;
+}
+
+export function parseChatSessionCreatePayload(payload: unknown): {
+  source: ChannelSource;
+  title?: string;
+} {
+  const result = ChatSessionCreateRequestSchema.safeParse(payload);
+  if (!result.success) {
+    throw new Error(formatZodError("Invalid chat session request", result.error));
+  }
+  return result.data;
+}
+
+export function parseChatSessionSwitchPayload(payload: unknown): {
+  source: ChannelSource;
+  sessionId: string;
+} {
+  const result = ChatSessionSwitchRequestSchema.safeParse(payload);
+  if (!result.success) {
+    throw new Error(formatZodError("Invalid chat session request", result.error));
   }
   return result.data;
 }

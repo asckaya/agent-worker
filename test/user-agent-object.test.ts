@@ -87,6 +87,184 @@ describe("UserAgentObject run state", () => {
     await expect(finalState.json()).resolves.toMatchObject({ activeRuns: [] });
   });
 
+  it("carries recent conversation history across independent chat requests", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql);
+    const capturedRequests: unknown[] = [];
+    vi.stubGlobal(
+      "fetch",
+      createCapturingFetchMock(
+        [openAiTextResponse("Your name is Ada."), openAiTextResponse("Your name is Ada.")],
+        capturedRequests,
+      ),
+    );
+
+    await readEvents(await object.fetch(chatRequest("my name is Ada")));
+    await readEvents(await object.fetch(chatRequest("what is my name?")));
+
+    expect(messageTail(capturedRequests[1], 3)).toEqual([
+      { role: "user", content: "my name is Ada" },
+      { role: "assistant", content: "Your name is Ada." },
+      { role: "user", content: "what is my name?" },
+    ]);
+    expect(sql.memories).toHaveLength(0);
+  });
+
+  it("restores active session history after Durable Object restart", async () => {
+    const sql = new FakeSqlStorage();
+    const capturedRequests: unknown[] = [];
+    vi.stubGlobal(
+      "fetch",
+      createCapturingFetchMock(
+        [openAiTextResponse("Saved."), openAiTextResponse("You said mango.")],
+        capturedRequests,
+      ),
+    );
+
+    await readEvents(await createObject(sql).fetch(chatRequest("remember mango")));
+    await readEvents(await createObject(sql).fetch(chatRequest("what did I say?")));
+
+    expect(messageTail(capturedRequests[1], 3)).toEqual([
+      { role: "user", content: "remember mango" },
+      { role: "assistant", content: "Saved." },
+      { role: "user", content: "what did I say?" },
+    ]);
+  });
+
+  it("switches between persisted chat sessions", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql);
+    const capturedRequests: unknown[] = [];
+    vi.stubGlobal(
+      "fetch",
+      createCapturingFetchMock(
+        [
+          openAiTextResponse("Alpha saved."),
+          openAiTextResponse("Beta saved."),
+          openAiTextResponse("Alpha answer."),
+        ],
+        capturedRequests,
+      ),
+    );
+
+    const firstSession = await object.fetch(
+      jsonRequest("/chat-sessions", {
+        source: { channel: "telegram", chatId: "123" },
+        title: "alpha",
+      }),
+    );
+    const firstSessionId = ((await firstSession.json()) as { session: { id: string } }).session.id;
+    await readEvents(await object.fetch(chatRequest("alpha fact")));
+
+    await object.fetch(
+      jsonRequest("/chat-sessions", {
+        source: { channel: "telegram", chatId: "123" },
+        title: "beta",
+      }),
+    );
+    await readEvents(await object.fetch(chatRequest("beta fact")));
+
+    await object.fetch(
+      jsonRequest("/chat-sessions/active", {
+        source: { channel: "telegram", chatId: "123" },
+        sessionId: firstSessionId,
+      }),
+    );
+    await readEvents(await object.fetch(chatRequest("what is in this session?")));
+
+    const finalMessages = requestMessages(capturedRequests[2]);
+    expect(finalMessages).toContainEqual({ role: "user", content: "alpha fact" });
+    expect(finalMessages).not.toContainEqual({ role: "user", content: "beta fact" });
+  });
+
+  it("persists full conversation history across turns", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql);
+    const capturedRequests: unknown[] = [];
+    vi.stubGlobal(
+      "fetch",
+      createCapturingFetchMock(
+        Array.from({ length: 14 }, (_, index) => openAiTextResponse(`answer ${index}`)),
+        capturedRequests,
+      ),
+    );
+
+    for (let index = 0; index < 13; index += 1) {
+      await readEvents(await object.fetch(chatRequest(`turn ${index}`)));
+    }
+    await readEvents(await object.fetch(chatRequest("final question")));
+
+    const finalMessages = requestMessages(capturedRequests[13]);
+    expect(finalMessages).toContainEqual({ role: "user", content: "turn 0" });
+    expect(finalMessages).toContainEqual({ role: "assistant", content: "answer 0" });
+    expect(finalMessages).toContainEqual({ role: "user", content: "turn 12" });
+    expect(messageTail(capturedRequests[13], 1)).toEqual([
+      { role: "user", content: "final question" },
+    ]);
+  });
+
+  it("clears conversation history when the session is reset", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql);
+    const capturedRequests: unknown[] = [];
+    vi.stubGlobal(
+      "fetch",
+      createCapturingFetchMock(
+        [openAiTextResponse("Noted."), openAiTextResponse("Fresh answer.")],
+        capturedRequests,
+      ),
+    );
+
+    await readEvents(await object.fetch(chatRequest("remember pineapple")));
+    await object.fetch(
+      jsonRequest("/sessions/stop", {
+        source: { channel: "telegram", chatId: "123" },
+        resetConversation: true,
+      }),
+    );
+    await readEvents(await object.fetch(chatRequest("what fruit did I mention?")));
+
+    const messages = requestMessages(capturedRequests[1]);
+    expect(messages).not.toContainEqual(
+      expect.objectContaining({ role: "user", content: "remember pineapple" }),
+    );
+    expect(messageTail(capturedRequests[1], 1)).toEqual([
+      { role: "user", content: "what fruit did I mention?" },
+    ]);
+  });
+
+  it("uses approved tool continuations in later conversation history", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql);
+    const capturedRequests: unknown[] = [];
+    vi.stubGlobal(
+      "fetch",
+      createCapturingFetchMock(
+        [
+          openAiToolCallResponse("fetch_url", { url: "https://example.com" }),
+          openAiTextResponse("The page says Example page body."),
+          openAiTextResponse("It found Example page body."),
+        ],
+        capturedRequests,
+      ),
+    );
+
+    const firstEvents = await readEvents(await object.fetch(chatRequest("fetch this page")));
+    const approval = approvalFromEvents(firstEvents);
+
+    await readEvents(await object.fetch(approveRequest(approval.id)));
+    await readEvents(await object.fetch(chatRequest("what did you find?")));
+
+    expect(messageTail(capturedRequests[2], 3)).toEqual([
+      { role: "user", content: "fetch this page" },
+      { role: "assistant", content: "The page says Example page body." },
+      { role: "user", content: "what did you find?" },
+    ]);
+    expect(JSON.stringify(requestMessages(capturedRequests[2]))).not.toContain(
+      "Tool approval required",
+    );
+  });
+
   it("stores bounded non-secret LLM profiles and resolves key availability from env", async () => {
     const sql = new FakeSqlStorage();
     const object = createObject(sql, { OPENROUTER_API_KEY: "secret-key" } as Partial<Env>);
@@ -436,6 +614,49 @@ function createFetchMock(llmResponses: MockLlmResponse[]) {
   });
 }
 
+function createCapturingFetchMock(llmResponses: MockLlmResponse[], capturedRequests: unknown[]) {
+  return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = input instanceof Request ? input.url : String(input);
+    if (url.startsWith("https://llm.test/")) {
+      capturedRequests.push(await readRequestJson(input, init));
+      const response = llmResponses.shift();
+      if (!response) throw new Error("Unexpected LLM request.");
+      return typeof response === "function" ? response() : response;
+    }
+
+    if (url === "https://example.com/") {
+      return new Response("Example page body", {
+        headers: { "Content-Type": "text/plain" },
+      });
+    }
+
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+}
+
+async function readRequestJson(input: RequestInfo | URL, init?: RequestInit) {
+  const text = input instanceof Request
+    ? await input.clone().text()
+    : typeof init?.body === "string"
+      ? init.body
+      : "";
+  return text ? JSON.parse(text) as unknown : {};
+}
+
+function requestMessages(requestBody: unknown) {
+  const body = requestBody as { messages?: Array<{ role?: string; content?: unknown }> };
+  return body.messages ?? [];
+}
+
+function messageTail(requestBody: unknown, count: number) {
+  return requestMessages(requestBody)
+    .slice(-count)
+    .map((message) => ({
+      role: message.role,
+      content: message.content,
+    }));
+}
+
 function openAiTextResponse(text: string) {
   return openAiSse([{ choices: [{ delta: { content: text } }] }, "[DONE]"]);
 }
@@ -529,6 +750,7 @@ interface PendingApprovalRow {
   id: string;
   channel: string;
   chat_id: string;
+  session_id?: string | null;
   tool_name: string;
   tool_input_json: string;
   risk: string;
@@ -554,16 +776,47 @@ interface TaskRow {
   notified_at: number | null;
 }
 
+interface ChatSessionRow {
+  id: string;
+  channel: string;
+  chat_id: string;
+  title: string;
+  created_at: number;
+  updated_at: number;
+}
+
+interface ActiveChatSessionRow {
+  channel: string;
+  chat_id: string;
+  session_id: string;
+  updated_at: number;
+}
+
+interface ChatMessageRow {
+  id: string;
+  session_id: string;
+  channel: string;
+  chat_id: string;
+  role: "user" | "assistant";
+  content: string;
+  sequence: number;
+  created_at: number;
+}
+
 class FakeSqlStorage {
   readonly memories: StoredMemory[] = [];
   readonly pendingApprovals: PendingApprovalRow[] = [];
   readonly runtimeSettings: RuntimeSettingRow[] = [];
   readonly tasks: TaskRow[] = [];
+  readonly chatSessions: ChatSessionRow[] = [];
+  readonly activeChatSessions: ActiveChatSessionRow[] = [];
+  readonly chatMessages: ChatMessageRow[] = [];
   alarm: number | null = null;
 
   exec(sql: string, ...bindings: Array<string | number | null>) {
     const normalized = sql.replace(/\s+/g, " ").trim();
     if (normalized.startsWith("CREATE ")) return [];
+    if (normalized.startsWith("ALTER ")) return [];
 
     if (normalized === "SELECT COUNT(*) AS count FROM memories") {
       return [{ count: this.memories.length }];
@@ -640,6 +893,120 @@ class FakeSqlStorage {
         completed_at: typeof completedAt === "number" ? completedAt : null,
         notified_at: typeof notifiedAt === "number" ? notifiedAt : null,
       });
+      return [];
+    }
+
+    if (normalized.startsWith("SELECT channel, chat_id, session_id, updated_at FROM active_chat_sessions")) {
+      const [channel, chatId] = bindings;
+      return this.activeChatSessions
+        .filter((session) => session.channel === channel && session.chat_id === chatId)
+        .slice(0, 1);
+    }
+
+    if (normalized === "DELETE FROM active_chat_sessions WHERE channel = ? AND chat_id = ?") {
+      const [channel, chatId] = bindings;
+      this.deleteRows(
+        this.activeChatSessions,
+        (session) => session.channel === channel && session.chat_id === chatId,
+      );
+      return [];
+    }
+
+    if (normalized.startsWith("SELECT id, channel, chat_id, title, created_at, updated_at FROM chat_sessions WHERE id = ?")) {
+      return this.chatSessions.filter((session) => session.id === bindings[0]).slice(0, 1);
+    }
+
+    if (normalized.startsWith("SELECT id, channel, chat_id, title, created_at, updated_at FROM chat_sessions WHERE channel = ? AND chat_id = ?")) {
+      const [channel, chatId] = bindings;
+      return this.chatSessions
+        .filter((session) => session.channel === channel && session.chat_id === chatId)
+        .sort((left, right) => right.updated_at - left.updated_at || right.created_at - left.created_at);
+    }
+
+    if (normalized.startsWith("INSERT INTO chat_sessions")) {
+      const [id, channel, chatId, title, createdAt, updatedAt] = bindings;
+      this.chatSessions.push({
+        id: String(id),
+        channel: String(channel),
+        chat_id: String(chatId),
+        title: String(title),
+        created_at: Number(createdAt),
+        updated_at: Number(updatedAt),
+      });
+      return [];
+    }
+
+    if (normalized.startsWith("INSERT INTO active_chat_sessions")) {
+      const [channel, chatId, sessionId, updatedAt] = bindings;
+      const existing = this.activeChatSessions.find(
+        (session) => session.channel === channel && session.chat_id === chatId,
+      );
+      if (existing) {
+        existing.session_id = String(sessionId);
+        existing.updated_at = Number(updatedAt);
+      } else {
+        this.activeChatSessions.push({
+          channel: String(channel),
+          chat_id: String(chatId),
+          session_id: String(sessionId),
+          updated_at: Number(updatedAt),
+        });
+      }
+      return [];
+    }
+
+    if (normalized.startsWith("SELECT id, session_id, channel, chat_id, role, content, sequence, created_at FROM chat_messages WHERE session_id = ?")) {
+      return this.chatMessages
+        .filter((message) => message.session_id === bindings[0])
+        .sort((left, right) => left.sequence - right.sequence);
+    }
+
+    if (normalized.startsWith("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM chat_messages WHERE session_id = ?")) {
+      const sessionMessages = this.chatMessages.filter((message) => message.session_id === bindings[0]);
+      return [{
+        sequence: sessionMessages.length
+          ? Math.max(...sessionMessages.map((message) => message.sequence))
+          : 0,
+      }];
+    }
+
+    if (normalized.startsWith("INSERT INTO chat_messages")) {
+      const [id, sessionId, channel, chatId, role, content, sequence, createdAt] = bindings;
+      this.chatMessages.push({
+        id: String(id),
+        session_id: String(sessionId),
+        channel: String(channel),
+        chat_id: String(chatId),
+        role: role === "assistant" ? "assistant" : "user",
+        content: String(content),
+        sequence: Number(sequence),
+        created_at: Number(createdAt),
+      });
+      return [];
+    }
+
+    if (normalized.startsWith("SELECT id, content FROM chat_messages WHERE session_id = ? AND role = 'assistant'")) {
+      return this.chatMessages
+        .filter((message) => message.session_id === bindings[0] && message.role === "assistant")
+        .sort((left, right) => right.sequence - left.sequence)
+        .map(({ id, content }) => ({ id, content }));
+    }
+
+    if (normalized === "UPDATE chat_messages SET content = ? WHERE id = ?") {
+      const [content, id] = bindings;
+      const message = this.chatMessages.find((item) => item.id === id);
+      if (message) {
+        message.content = String(content);
+      }
+      return [];
+    }
+
+    if (normalized === "UPDATE chat_sessions SET updated_at = ? WHERE id = ?") {
+      const [updatedAt, id] = bindings;
+      const session = this.chatSessions.find((item) => item.id === id);
+      if (session) {
+        session.updated_at = Number(updatedAt);
+      }
       return [];
     }
 
@@ -720,11 +1087,22 @@ class FakeSqlStorage {
     }
 
     if (normalized.startsWith("INSERT INTO pending_approvals")) {
-      const [id, channel, chatId, toolName, toolInputJson, risk, createdAt, expiresAt] = bindings;
+      const [
+        id,
+        channel,
+        chatId,
+        sessionId,
+        toolName,
+        toolInputJson,
+        risk,
+        createdAt,
+        expiresAt,
+      ] = bindings;
       this.pendingApprovals.push({
         id: String(id),
         channel: String(channel),
         chat_id: String(chatId),
+        session_id: String(sessionId),
         tool_name: String(toolName),
         tool_input_json: String(toolInputJson),
         risk: String(risk),
@@ -749,14 +1127,17 @@ class FakeSqlStorage {
     }
 
     if (
-      normalized.includes("FROM pending_approvals WHERE channel = ? AND chat_id = ? AND tool_name = ?")
+      normalized.includes("FROM pending_approvals WHERE channel = ?") &&
+      normalized.includes("AND session_id = ?") &&
+      normalized.includes("AND tool_name = ?")
     ) {
-      const [channel, chatId, toolName, toolInputJson, expiresAfter] = bindings;
+      const [channel, chatId, sessionId, toolName, toolInputJson, expiresAfter] = bindings;
       return this.sortedApprovals()
         .filter(
           (approval) =>
             approval.channel === channel &&
             approval.chat_id === chatId &&
+            (approval.session_id ?? "") === sessionId &&
             approval.tool_name === toolName &&
             approval.tool_input_json === toolInputJson &&
             approval.expires_at > Number(expiresAfter),

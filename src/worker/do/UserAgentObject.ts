@@ -30,16 +30,20 @@ import type {
   ActiveAgentRun,
   ChannelSource,
   ChatMessage,
+  ClientChatMessage,
   ChatRequest,
   Env,
   LlmConfig,
   PendingToolApproval,
+  StoredChatSession,
   StoredMemory,
   StoredTask,
   ToolCall,
 } from "../types";
 import {
   parseApprovalActionPayload,
+  parseChatSessionCreatePayload,
+  parseChatSessionSwitchPayload,
   parseChatRequestPayload,
   parseMemoryCreatePayload,
   parseSessionControlPayload,
@@ -56,8 +60,8 @@ const MAX_PENDING_APPROVALS = 50;
 const MAX_TOOL_INPUT_JSON_CHARS = 8_000;
 const MAX_TOOL_RESULT_SUMMARY_CHARS = 12_000;
 const MAX_ACTIVE_RUN_FOLLOW_UPS = 3;
-const MAX_EPHEMERAL_HISTORY_MESSAGES = 8;
 const MAX_TASKS = 200;
+const MAX_SESSION_TITLE_CHARS = 80;
 const TASK_ALARM_RETRY_DELAY_MS = 60_000;
 
 interface AgentCallbacks {
@@ -72,6 +76,7 @@ interface PendingApprovalRow {
   id: string;
   channel: string;
   chat_id: string;
+  session_id?: string | null;
   tool_name: string;
   tool_input_json: string;
   risk: string;
@@ -97,6 +102,33 @@ interface TaskRow {
   notified_at: number | null;
 }
 
+interface ChatSessionRow {
+  id: string;
+  channel: string;
+  chat_id: string;
+  title: string;
+  created_at: number;
+  updated_at: number;
+}
+
+interface ActiveChatSessionRow {
+  channel: string;
+  chat_id: string;
+  session_id: string;
+  updated_at: number;
+}
+
+interface ChatMessageRow {
+  id: string;
+  session_id: string;
+  channel: string;
+  chat_id: string;
+  role: "user" | "assistant";
+  content: string;
+  sequence: number;
+  created_at: number;
+}
+
 interface ActiveRunRecord extends Omit<ActiveAgentRun, "queuedMessageCount"> {
   key: string;
   abortController: AbortController;
@@ -108,6 +140,7 @@ interface ActiveRunRecord extends Omit<ActiveAgentRun, "queuedMessageCount"> {
 interface PausedApprovalSession {
   approvalId: string;
   source?: ChannelSource;
+  sessionId?: string;
   llm: LlmConfig;
   modelMessages: ChatMessage[];
   toolCallId: string;
@@ -119,6 +152,7 @@ interface PausedApprovalSession {
 
 interface AgentLoopOptions {
   runId?: string;
+  sessionId?: string;
   signal?: AbortSignal;
   consumePendingFollowUps?: () => ChatRequest[];
 }
@@ -170,6 +204,18 @@ export class UserAgentObject {
 
     if (request.method === "POST" && url.pathname === "/memories/curate") {
       return this.handleCreateCuratedMemory(request);
+    }
+
+    if (request.method === "GET" && url.pathname === "/chat-sessions") {
+      return this.handleListChatSessions(url);
+    }
+
+    if (request.method === "POST" && url.pathname === "/chat-sessions") {
+      return this.handleCreateChatSession(request);
+    }
+
+    if (request.method === "POST" && url.pathname === "/chat-sessions/active") {
+      return this.handleSwitchChatSession(request);
     }
 
     if (request.method === "GET" && url.pathname === "/tasks") {
@@ -334,6 +380,52 @@ export class UserAgentObject {
     }
   }
 
+  private handleListChatSessions(url: URL) {
+    try {
+      const source = {
+        channel: url.searchParams.get("channel")?.trim() || "api",
+        chatId: url.searchParams.get("chatId")?.trim() || "default",
+      };
+      return Response.json({
+        ok: true,
+        activeSessionId: this.getActiveChatSession(source)?.id,
+        sessions: this.getChatSessions(source),
+      });
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  private async handleCreateChatSession(request: Request) {
+    try {
+      const payload = parseChatSessionCreatePayload(await request.json().catch(() => ({})));
+      const session = this.createChatSession(payload.source, payload.title);
+      return Response.json({
+        ok: true,
+        session,
+        activeSessionId: session.id,
+        sessions: this.getChatSessions(payload.source),
+      });
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  private async handleSwitchChatSession(request: Request) {
+    try {
+      const payload = parseChatSessionSwitchPayload(await request.json().catch(() => ({})));
+      const session = this.switchChatSession(payload.source, payload.sessionId);
+      return Response.json({
+        ok: true,
+        session,
+        activeSessionId: session.id,
+        sessions: this.getChatSessions(payload.source),
+      });
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
   private async handleCreateTask(request: Request) {
     try {
       const payload = parseTaskCreatePayload(await request.json().catch(() => ({})));
@@ -472,9 +564,19 @@ export class UserAgentObject {
       return errorResponse(error);
     }
 
-    const pausedApproval = this.getPausedApprovalForSource(payload.source);
+    let session: StoredChatSession;
+    try {
+      session = this.resolveChatSession(payload);
+    } catch (error) {
+      return errorResponse(error);
+    }
+
+    const pausedApproval = this.getPausedApprovalForSession(payload.source, session.id);
     if (pausedApproval) {
-      const queued = this.enqueuePausedApprovalFollowUp(pausedApproval, payload);
+      const queued = this.enqueuePausedApprovalFollowUp(pausedApproval, {
+        ...payload,
+        sessionId: session.id,
+      });
       return this.immediateSseDone({
         content: formatPausedApprovalMessage(pausedApproval, queued),
         queued,
@@ -484,7 +586,7 @@ export class UserAgentObject {
 
     const existingRun = this.getActiveRun(payload.source);
     if (existingRun) {
-      const queued = this.enqueueFollowUp(existingRun, payload);
+      const queued = this.enqueueFollowUp(existingRun, { ...payload, sessionId: session.id });
       return this.immediateSseDone({
         content: formatActiveRunMessage(existingRun, queued),
         activeRun: activeRunToStatus(existingRun),
@@ -497,7 +599,7 @@ export class UserAgentObject {
     const writer = writable.getWriter();
 
     this.ctx.waitUntil(
-      this.runChat(payload, writer, activeRun)
+      this.runChat({ ...payload, sessionId: session.id }, session, writer, activeRun)
         .catch(async (error: unknown) => {
           if (activeRun.stopRequested) {
             await writeSse(writer, "done", {
@@ -527,6 +629,7 @@ export class UserAgentObject {
 
   private async runChat(
     payload: ChatRequest,
+    session: StoredChatSession,
     writer: WritableStreamDefaultWriter<Uint8Array>,
     activeRun: ActiveRunRecord,
   ) {
@@ -537,7 +640,7 @@ export class UserAgentObject {
       onToolResult: async (data) => writeSse(writer, "tool_result", data),
       onApprovalRequired: async (data) => writeSse(writer, "approval_required", data),
     };
-    let currentPayload = payload;
+    let currentPayload = this.withConversationHistory(payload, session);
     let combinedContent = "";
     let ephemeralHistory = currentPayload.history ?? [];
     let result: Awaited<ReturnType<UserAgentObject["runAgent"]>> | undefined;
@@ -545,8 +648,10 @@ export class UserAgentObject {
 
     while (true) {
       try {
+        this.appendChatMessage(session, "user", currentPayload.message);
         result = await this.runAgent(currentPayload, callbacks, {
           runId: firstTurn ? activeRun.runId : undefined,
+          sessionId: session.id,
           signal: activeRun.abortController.signal,
           consumePendingFollowUps: () => this.consumeFollowUps(activeRun),
         });
@@ -582,6 +687,7 @@ export class UserAgentObject {
         currentPayload.message,
         result.content,
       );
+      this.appendChatMessage(session, "assistant", result.content);
 
       if (result.pendingApproval) {
         if (result.pausedFollowUpCount > 0) {
@@ -614,8 +720,12 @@ export class UserAgentObject {
   }
 
   private async handleRespond(request: Request) {
-    const payload = await readChatRequest(request);
-    const result = await this.runAgent(payload, {});
+    const rawPayload = await readChatRequest(request);
+    const session = this.resolveChatSession(rawPayload);
+    const payload = this.withConversationHistory(rawPayload, session);
+    this.appendChatMessage(session, "user", payload.message);
+    const result = await this.runAgent(payload, {}, { sessionId: session.id });
+    this.appendChatMessage(session, "assistant", result.content);
     return Response.json({ ok: true, ...result });
   }
 
@@ -623,10 +733,14 @@ export class UserAgentObject {
     try {
       const payload = parseSessionControlPayload(await request.json().catch(() => ({})));
       const stoppedRuns = this.stopActiveRuns(payload.source);
+      if (payload.resetConversation) {
+        this.resetConversation(payload.source);
+      }
       return Response.json({
         ok: true,
         stopped: stoppedRuns.length > 0,
         activeRuns: stoppedRuns,
+        conversationReset: payload.resetConversation,
       });
     } catch (error) {
       return errorResponse(error);
@@ -677,6 +791,7 @@ export class UserAgentObject {
     return this.runAgentWithMessages({
       llm: payload.llm,
       source: payload.source,
+      sessionId: options.sessionId ?? payload.sessionId,
       modelMessages,
       callbacks,
       signal: options.signal,
@@ -687,6 +802,7 @@ export class UserAgentObject {
   private async runAgentWithMessages(options: {
     llm: LlmConfig;
     source?: ChannelSource;
+    sessionId?: string;
     modelMessages: ChatMessage[];
     callbacks: AgentCallbacks;
     signal?: AbortSignal;
@@ -700,7 +816,8 @@ export class UserAgentObject {
     const toolExecutor = new ToolExecutor(registry, this.createToolContext(), {
       timeoutMs: DEFAULT_TOOL_TIMEOUT_MS,
       approvalGate: {
-        create: async ({ tool, input }) => this.createPendingApproval(options.source, tool, input),
+        create: async ({ tool, input }) =>
+          this.createPendingApproval(options.source, options.sessionId, tool, input),
       },
     });
     let finalContent = "";
@@ -803,6 +920,7 @@ export class UserAgentObject {
           const pausedFollowUps = options.consumePendingFollowUps?.() ?? [];
           this.savePausedApprovalSession(toolExecution.approval, {
             source: options.source,
+            sessionId: options.sessionId,
             llm: options.llm,
             modelMessages: options.modelMessages,
             toolCallId: toolCall.id,
@@ -973,6 +1091,7 @@ export class UserAgentObject {
         id TEXT PRIMARY KEY,
         channel TEXT NOT NULL,
         chat_id TEXT NOT NULL,
+        session_id TEXT NOT NULL DEFAULT '',
         tool_name TEXT NOT NULL,
         tool_input_json TEXT NOT NULL,
         risk TEXT NOT NULL,
@@ -980,9 +1099,55 @@ export class UserAgentObject {
         expires_at INTEGER NOT NULL
       )
     `);
+    try {
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE pending_approvals ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
+      );
+    } catch {
+      // Existing deployments already have this column.
+    }
     this.ctx.storage.sql.exec(`
       CREATE INDEX IF NOT EXISTS pending_approvals_chat_idx
-      ON pending_approvals (channel, chat_id, created_at)
+      ON pending_approvals (channel, chat_id, session_id, created_at)
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS chat_sessions (
+        id TEXT PRIMARY KEY,
+        channel TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE INDEX IF NOT EXISTS chat_sessions_source_idx
+      ON chat_sessions (channel, chat_id, updated_at)
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS active_chat_sessions (
+        channel TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (channel, chat_id)
+      )
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE INDEX IF NOT EXISTS chat_messages_session_sequence_idx
+      ON chat_messages (session_id, sequence)
     `);
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS tasks (
@@ -1362,6 +1527,232 @@ export class UserAgentObject {
     return runs.map(activeRunToStatus);
   }
 
+  private withConversationHistory(payload: ChatRequest, session: StoredChatSession): ChatRequest {
+    return {
+      ...payload,
+      sessionId: session.id,
+      history: mergeClientHistories(
+        this.getChatSessionHistory(session.id),
+        payload.history ?? [],
+      ),
+    };
+  }
+
+  private resolveChatSession(payload: Pick<ChatRequest, "source" | "sessionId" | "message">) {
+    const source = normalizeSource(payload.source);
+    if (payload.sessionId) {
+      const session = this.getChatSession(payload.sessionId);
+      if (!session || session.channel !== source.channel || session.chatId !== source.chatId) {
+        throw new HttpError("Chat session not found for this source.", 404);
+      }
+      this.setActiveChatSession(source, session.id);
+      return session;
+    }
+
+    return this.getOrCreateActiveChatSession(source, payload.message);
+  }
+
+  private getOrCreateActiveChatSession(source: ChannelSource, titleSeed?: string) {
+    const active = this.getActiveChatSession(source);
+    if (active) return active;
+    return this.createChatSession(source, titleSeed);
+  }
+
+  private getActiveChatSession(source: ChannelSource | undefined) {
+    const normalizedSource = normalizeSource(source);
+    const row = this.query<ActiveChatSessionRow>(
+      `
+        SELECT channel, chat_id, session_id, updated_at
+        FROM active_chat_sessions
+        WHERE channel = ? AND chat_id = ?
+        LIMIT 1
+      `,
+      normalizedSource.channel,
+      normalizedSource.chatId,
+    )[0];
+    if (!row) return null;
+
+    const session = this.getChatSession(row.session_id);
+    if (!session) {
+      this.ctx.storage.sql.exec(
+        "DELETE FROM active_chat_sessions WHERE channel = ? AND chat_id = ?",
+        normalizedSource.channel,
+        normalizedSource.chatId,
+      );
+      return null;
+    }
+    return session;
+  }
+
+  private getChatSession(sessionId: string) {
+    const row = this.query<ChatSessionRow>(
+      `
+        SELECT id, channel, chat_id, title, created_at, updated_at
+        FROM chat_sessions
+        WHERE id = ?
+        LIMIT 1
+      `,
+      sessionId,
+    )[0];
+    return row ? rowToChatSession(row) : null;
+  }
+
+  private getChatSessions(source: ChannelSource | undefined) {
+    const normalizedSource = normalizeSource(source);
+    const activeSessionId = this.getActiveChatSession(normalizedSource)?.id;
+    return this.query<ChatSessionRow>(
+      `
+        SELECT id, channel, chat_id, title, created_at, updated_at
+        FROM chat_sessions
+        WHERE channel = ? AND chat_id = ?
+        ORDER BY updated_at DESC, created_at DESC
+      `,
+      normalizedSource.channel,
+      normalizedSource.chatId,
+    ).map((row) => ({
+      ...rowToChatSession(row),
+      active: row.id === activeSessionId,
+    }));
+  }
+
+  private createChatSession(source: ChannelSource | undefined, titleSeed?: string) {
+    const normalizedSource = normalizeSource(source);
+    const now = Date.now();
+    const session: StoredChatSession = {
+      id: this.generateSessionId(),
+      channel: normalizedSource.channel,
+      chatId: normalizedSource.chatId,
+      title: normalizeSessionTitle(titleSeed),
+      created_at: now,
+      updated_at: now,
+      active: true,
+    };
+    this.ctx.storage.sql.exec(
+      `
+        INSERT INTO chat_sessions (id, channel, chat_id, title, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `,
+      session.id,
+      session.channel,
+      session.chatId,
+      session.title,
+      session.created_at,
+      session.updated_at,
+    );
+    this.setActiveChatSession(normalizedSource, session.id);
+    return session;
+  }
+
+  private switchChatSession(source: ChannelSource | undefined, sessionId: string) {
+    const normalizedSource = normalizeSource(source);
+    const session = this.getChatSession(sessionId);
+    if (!session || session.channel !== normalizedSource.channel || session.chatId !== normalizedSource.chatId) {
+      throw new HttpError("Chat session not found for this source.", 404);
+    }
+    this.setActiveChatSession(normalizedSource, session.id);
+    return { ...session, active: true };
+  }
+
+  private setActiveChatSession(source: ChannelSource | undefined, sessionId: string) {
+    const normalizedSource = normalizeSource(source);
+    this.ctx.storage.sql.exec(
+      `
+        INSERT INTO active_chat_sessions (channel, chat_id, session_id, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(channel, chat_id) DO UPDATE SET
+          session_id = excluded.session_id,
+          updated_at = excluded.updated_at
+      `,
+      normalizedSource.channel,
+      normalizedSource.chatId,
+      sessionId,
+      Date.now(),
+    );
+  }
+
+  private getChatSessionHistory(sessionId: string): ClientChatMessage[] {
+    return this.query<ChatMessageRow>(
+      `
+        SELECT id, session_id, channel, chat_id, role, content, sequence, created_at
+        FROM chat_messages
+        WHERE session_id = ?
+        ORDER BY sequence ASC
+      `,
+      sessionId,
+    )
+      .filter((row) => row.role === "user" || row.role === "assistant")
+      .map((row) => ({ role: row.role, content: row.content }));
+  }
+
+  private appendChatMessage(
+    session: StoredChatSession,
+    role: "user" | "assistant",
+    content: string,
+  ) {
+    const trimmed = content.trim();
+    if (!trimmed) return;
+    const nextSequence =
+      (this.query<{ sequence: number }>(
+        "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM chat_messages WHERE session_id = ?",
+        session.id,
+      )[0]?.sequence ?? 0) + 1;
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      `
+        INSERT INTO chat_messages
+          (id, session_id, channel, chat_id, role, content, sequence, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      this.generateMessageId(),
+      session.id,
+      session.channel,
+      session.chatId,
+      role,
+      content,
+      nextSequence,
+      now,
+    );
+    this.touchChatSession(session.id, now);
+  }
+
+  private replacePendingApprovalAssistantMessage(
+    sessionId: string | undefined,
+    approval: PendingToolApproval,
+    content: string,
+  ) {
+    const session = sessionId ? this.getChatSession(sessionId) : null;
+    if (!session) return;
+    const rows = this.query<Pick<ChatMessageRow, "id" | "content">>(
+      `
+        SELECT id, content
+        FROM chat_messages
+        WHERE session_id = ? AND role = 'assistant'
+        ORDER BY sequence DESC
+      `,
+      session.id,
+    );
+    const existing = rows.find((row) => isPendingApprovalAssistant(row.content, approval));
+    if (!existing) {
+      this.appendChatMessage(session, "assistant", content);
+      return;
+    }
+    this.ctx.storage.sql.exec("UPDATE chat_messages SET content = ? WHERE id = ?", content, existing.id);
+    this.touchChatSession(session.id);
+  }
+
+  private touchChatSession(sessionId: string, updatedAt = Date.now()) {
+    this.ctx.storage.sql.exec(
+      "UPDATE chat_sessions SET updated_at = ? WHERE id = ?",
+      updatedAt,
+      sessionId,
+    );
+  }
+
+  private resetConversation(source: ChannelSource | undefined) {
+    if (!source) return null;
+    return this.createChatSession(source, "New chat");
+  }
+
   private getMemoryCount() {
     return this.memoryProvider.count();
   }
@@ -1435,6 +1826,7 @@ export class UserAgentObject {
 
   private createPendingApproval(
     source: ChannelSource | undefined,
+    sessionId: string | undefined,
     tool: ToolDefinition,
     input: unknown,
   ) {
@@ -1447,12 +1839,14 @@ export class UserAgentObject {
 
     const channel = source?.channel ?? "api";
     const chatId = source?.chatId ?? "default";
+    const normalizedSessionId = sessionId ?? "";
     const existing = this.query<PendingApprovalRow>(
       `
-        SELECT id, channel, chat_id, tool_name, tool_input_json, risk, created_at, expires_at
+        SELECT id, channel, chat_id, session_id, tool_name, tool_input_json, risk, created_at, expires_at
         FROM pending_approvals
         WHERE channel = ?
           AND chat_id = ?
+          AND session_id = ?
           AND tool_name = ?
           AND tool_input_json = ?
           AND expires_at > ?
@@ -1461,6 +1855,7 @@ export class UserAgentObject {
       `,
       channel,
       chatId,
+      normalizedSessionId,
       tool.name,
       toolInputJson,
       Date.now(),
@@ -1472,6 +1867,7 @@ export class UserAgentObject {
       id: this.createApprovalId(),
       channel,
       chatId,
+      sessionId,
       toolName: tool.name,
       toolInput: input,
       risk: tool.risk,
@@ -1482,12 +1878,13 @@ export class UserAgentObject {
     this.ctx.storage.sql.exec(
       `
         INSERT INTO pending_approvals
-          (id, channel, chat_id, tool_name, tool_input_json, risk, created_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          (id, channel, chat_id, session_id, tool_name, tool_input_json, risk, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       approval.id,
       approval.channel,
       approval.chatId,
+      normalizedSessionId,
       approval.toolName,
       toolInputJson,
       approval.risk,
@@ -1519,7 +1916,7 @@ export class UserAgentObject {
     return paused;
   }
 
-  private getPausedApprovalForSource(source: ChannelSource | undefined) {
+  private getPausedApprovalForSession(source: ChannelSource | undefined, sessionId: string) {
     this.prunePausedApprovalSessions();
     const normalizedSource = normalizeSource(source);
     return [...this.pausedApprovals.values()]
@@ -1527,7 +1924,8 @@ export class UserAgentObject {
         const pausedSource = normalizeSource(paused.source);
         return (
           pausedSource.channel === normalizedSource.channel &&
-          pausedSource.chatId === normalizedSource.chatId
+          pausedSource.chatId === normalizedSource.chatId &&
+          paused.sessionId === sessionId
         );
       })
       .sort((left, right) => right.expiresAt - left.expiresAt)[0];
@@ -1658,6 +2056,9 @@ export class UserAgentObject {
           activeRun.abortController.signal,
         )
       : formatApprovedToolResult(approval, toolResult);
+    if (approval.sessionId) {
+      this.replacePendingApprovalAssistantMessage(approval.sessionId, approval, content);
+    }
 
     return {
       approval,
@@ -1685,10 +2086,12 @@ export class UserAgentObject {
 
     const pendingFollowUps = cloneChatRequests(paused.pendingFollowUps);
     const source = paused.source ?? { channel: approval.channel, chatId: approval.chatId };
+    const sessionId = paused.sessionId ?? approval.sessionId;
     let currentLlm = llm;
     let nextStep: number | undefined = paused.nextStep;
     let combinedContent = "";
     let firstTurn = true;
+    let currentFollowUp: ChatRequest | undefined;
 
     while (true) {
       let result: Awaited<ReturnType<UserAgentObject["runAgentWithMessages"]>>;
@@ -1696,6 +2099,7 @@ export class UserAgentObject {
         result = await this.runAgentWithMessages({
           llm: currentLlm,
           source,
+          sessionId,
           modelMessages,
           callbacks,
           signal: activeRun.abortController.signal,
@@ -1722,6 +2126,7 @@ export class UserAgentObject {
         });
         currentLlm = interruptedFollowUp.llm ?? currentLlm;
         nextStep = undefined;
+        currentFollowUp = interruptedFollowUp;
         firstTurn = false;
         continue;
       }
@@ -1732,8 +2137,18 @@ export class UserAgentObject {
             combinedContent,
             `Follow-up:\n${result.content.trim() || "No response."}`,
           );
+      if (currentFollowUp && sessionId) {
+        const session = this.getChatSession(sessionId);
+        if (session) {
+          this.appendChatMessage(session, "user", currentFollowUp.message);
+          this.appendChatMessage(session, "assistant", result.content);
+        }
+      } else if (sessionId) {
+        this.replacePendingApprovalAssistantMessage(sessionId, approval, result.content);
+      }
       nextStep = undefined;
       firstTurn = false;
+      currentFollowUp = undefined;
 
       if (result.pendingApproval) {
         if (result.pausedFollowUpCount > 0) {
@@ -1758,6 +2173,7 @@ export class UserAgentObject {
         content: followUp.message,
       });
       currentLlm = followUp.llm ?? currentLlm;
+      currentFollowUp = followUp;
     }
 
     return {
@@ -1839,7 +2255,7 @@ export class UserAgentObject {
     if (filter.channel && filter.chatId) {
       return this.query<PendingApprovalRow>(
         `
-          SELECT id, channel, chat_id, tool_name, tool_input_json, risk, created_at, expires_at
+          SELECT id, channel, chat_id, session_id, tool_name, tool_input_json, risk, created_at, expires_at
           FROM pending_approvals
           WHERE channel = ? AND chat_id = ?
           ORDER BY created_at DESC
@@ -1853,7 +2269,7 @@ export class UserAgentObject {
 
     return this.query<PendingApprovalRow>(
       `
-        SELECT id, channel, chat_id, tool_name, tool_input_json, risk, created_at, expires_at
+        SELECT id, channel, chat_id, session_id, tool_name, tool_input_json, risk, created_at, expires_at
         FROM pending_approvals
         ORDER BY created_at DESC
         LIMIT ?
@@ -1867,7 +2283,7 @@ export class UserAgentObject {
     this.pruneApprovals();
     const row = this.query<PendingApprovalRow>(
       `
-        SELECT id, channel, chat_id, tool_name, tool_input_json, risk, created_at, expires_at
+        SELECT id, channel, chat_id, session_id, tool_name, tool_input_json, risk, created_at, expires_at
         FROM pending_approvals
         WHERE id = ?
         LIMIT 1
@@ -1923,6 +2339,21 @@ export class UserAgentObject {
     return `t_${crypto.randomUUID().slice(0, 8)}`;
   }
 
+  private generateSessionId() {
+    for (let attempts = 0; attempts < 5; attempts += 1) {
+      const bytes = new Uint8Array(4);
+      crypto.getRandomValues(bytes);
+      const id = `s_${[...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+      if (!this.getChatSession(id)) return id;
+    }
+
+    return `s_${crypto.randomUUID()}`;
+  }
+
+  private generateMessageId() {
+    return `m_${crypto.randomUUID()}`;
+  }
+
   private createToolContext(): ToolContext {
     return {
       fetch: (input, init) => fetch(input, init),
@@ -1959,6 +2390,7 @@ function rowToApproval(row: PendingApprovalRow): PendingToolApproval {
     id: row.id,
     channel: row.channel,
     chatId: row.chat_id,
+    ...(row.session_id ? { sessionId: row.session_id } : {}),
     toolName: row.tool_name,
     toolInput: parseStoredJson(row.tool_input_json),
     risk: row.risk,
@@ -1978,6 +2410,17 @@ function rowToTask(row: TaskRow): StoredTask {
     created_at: row.created_at,
     completed_at: row.completed_at,
     notified_at: row.notified_at,
+  };
+}
+
+function rowToChatSession(row: ChatSessionRow): StoredChatSession {
+  return {
+    id: row.id,
+    channel: row.channel,
+    chatId: row.chat_id,
+    title: row.title,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
   };
 }
 
@@ -2012,6 +2455,62 @@ function appendParagraph(content: string, paragraph: string) {
   if (!trimmedContent) return trimmedParagraph;
   if (!trimmedParagraph) return trimmedContent;
   return `${trimmedContent}\n\n${trimmedParagraph}`;
+}
+
+function normalizeSessionTitle(seed: string | undefined) {
+  const title = (seed ?? "").trim().replace(/\s+/g, " ");
+  return (title || "New chat").slice(0, MAX_SESSION_TITLE_CHARS);
+}
+
+function mergeClientHistories(
+  storedHistory: ClientChatMessage[],
+  requestHistory: ClientChatMessage[],
+) {
+  const stored = clampConversationHistory(storedHistory);
+  const requested = clampConversationHistory(requestHistory);
+  if (requested.length === 0) return stored;
+  if (stored.length === 0) return requested;
+
+  const overlap = longestHistoryOverlap(stored, requested);
+  return clampConversationHistory([...stored, ...requested.slice(overlap)]);
+}
+
+function longestHistoryOverlap(left: ClientChatMessage[], right: ClientChatMessage[]) {
+  const maxOverlap = Math.min(left.length, right.length);
+  for (let size = maxOverlap; size > 0; size -= 1) {
+    const leftTail = left.slice(left.length - size);
+    const rightHead = right.slice(0, size);
+    if (leftTail.every((message, index) => isSameClientMessage(message, rightHead[index]))) {
+      return size;
+    }
+  }
+
+  return 0;
+}
+
+function isSameClientMessage(left: ClientChatMessage, right: ClientChatMessage) {
+  return left.role === right.role && left.content === right.content;
+}
+
+function isPendingApprovalAssistant(content: string, approval: PendingToolApproval) {
+  return (
+    content.includes(`Tool approval required: ${approval.toolName}`) &&
+    content.includes(`/approve ${approval.id}`)
+  );
+}
+
+function clampConversationHistory(history: ClientChatMessage[]) {
+  return history
+    .filter(
+      (message): message is ClientChatMessage =>
+        (message.role === "user" || message.role === "assistant") &&
+        typeof message.content === "string" &&
+        message.content.trim().length > 0,
+    )
+    .map((message) => ({
+      role: message.role,
+      content: message.content,
+    }));
 }
 
 function normalizeSource(source: ChannelSource | undefined): ChannelSource {
@@ -2061,19 +2560,26 @@ function throwIfAborted(signal: AbortSignal | undefined) {
   throw new Error("Run stopped.");
 }
 
-function appendEphemeralTurn(history: ChatRequest["history"], user: string, assistant: string) {
+function appendEphemeralTurn(
+  history: ChatRequest["history"],
+  user: string,
+  assistant: string,
+) {
   return [
     ...(history ?? []),
     { role: "user" as const, content: user },
     { role: "assistant" as const, content: assistant || "No response." },
-  ].slice(-MAX_EPHEMERAL_HISTORY_MESSAGES);
+  ];
 }
 
-function appendEphemeralUser(history: ChatRequest["history"], user: string) {
+function appendEphemeralUser(
+  history: ChatRequest["history"],
+  user: string,
+) {
   return [
     ...(history ?? []),
     { role: "user" as const, content: user },
-  ].slice(-MAX_EPHEMERAL_HISTORY_MESSAGES);
+  ];
 }
 
 function buildUserContent(message: string, attachments: ChatRequest["attachments"]) {

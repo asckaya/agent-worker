@@ -1,11 +1,9 @@
 import type { ChatMessage } from "../types";
 import { DEFAULT_SYSTEM_PROMPT } from "./prompts";
 
-const MAX_HISTORY_MESSAGES = 24;
 const MAX_MEMORY_ITEMS_IN_CONTEXT = 8;
 
 export function buildModelMessages(history: ChatMessage[], memories: string[]): ChatMessage[] {
-  const recent = history.slice(-MAX_HISTORY_MESSAGES);
   const messages: ChatMessage[] = [
     {
       role: "system",
@@ -24,7 +22,7 @@ export function buildModelMessages(history: ChatMessage[], memories: string[]): 
     });
   }
 
-  messages.push(...recent);
+  messages.push(...history);
   return messages;
 }
 
@@ -38,6 +36,6 @@ export function buildClientHistoryMessages(history: Array<{ role: string; conten
     )
     .map<ChatMessage>((message) => ({
       role: message.role,
-      content: message.content.slice(0, 16_000),
+      content: message.content,
     }));
 }

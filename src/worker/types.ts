@@ -79,6 +79,7 @@ export interface ChatRequest {
   attachments?: ChatContentPart[];
   llm: LlmConfig;
   source?: ChannelSource;
+  sessionId?: string;
 }
 
 export interface StoredMemory {
@@ -99,6 +100,16 @@ export interface StoredTask {
   notified_at: number | null;
 }
 
+export interface StoredChatSession {
+  id: string;
+  channel: string;
+  chatId: string;
+  title: string;
+  created_at: number;
+  updated_at: number;
+  active?: boolean;
+}
+
 export interface ChannelSource {
   channel: string;
   chatId: string;
@@ -108,6 +119,7 @@ export interface PendingToolApproval {
   id: string;
   channel: string;
   chatId: string;
+  sessionId?: string;
   toolName: string;
   toolInput: unknown;
   risk: string;

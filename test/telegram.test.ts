@@ -1311,6 +1311,84 @@ describe("telegram integration", () => {
       }),
     );
   });
+
+  it("switches Telegram chat sessions through /session", async () => {
+    const telegramFetch = vi.fn(async () =>
+      Response.json({ ok: true, result: { message_id: 42 } }),
+    );
+    vi.stubGlobal("fetch", telegramFetch);
+
+    const agentCalls: Array<{ path: string; body?: unknown; method: string }> = [];
+    const agentFetch = vi.fn(async (request: Request) => {
+      const url = new URL(request.url);
+      agentCalls.push({
+        path: url.pathname,
+        method: request.method,
+        body: request.method === "GET" ? undefined : await request.json(),
+      });
+      if (url.pathname === "/sessions/stop") {
+        return Response.json({ ok: true, stopped: false });
+      }
+      return Response.json({
+        ok: true,
+        session: {
+          id: "s_abc12345",
+          channel: "telegram",
+          chatId: "123",
+          title: "Trip planning",
+          created_at: 1,
+          updated_at: 1,
+          active: true,
+        },
+      });
+    });
+
+    await handleTelegramWebhook(
+      webhookRequest({
+        message: {
+          message_id: 13,
+          text: "/session s_abc12345",
+          chat: { id: 123, type: "private" },
+          from: { id: 42 },
+        },
+      }),
+      env({
+        TELEGRAM_SECRET_TOKEN: "secret",
+        TELEGRAM_BOT_TOKEN: "bot-token",
+        TELEGRAM_ALLOWED_CHAT_IDS: "123",
+        AGENT_OBJECT: agentNamespace(agentFetch),
+      }),
+    );
+
+    expect(agentCalls).toEqual([
+      {
+        path: "/sessions/stop",
+        method: "POST",
+        body: {
+          source: { channel: "telegram", chatId: "123" },
+        },
+      },
+      {
+        path: "/chat-sessions/active",
+        method: "POST",
+        body: {
+          source: { channel: "telegram", chatId: "123" },
+          sessionId: "s_abc12345",
+        },
+      },
+    ]);
+    expect(telegramFetch).toHaveBeenCalledWith(
+      "https://api.telegram.org/botbot-token/sendMessage",
+      expect.objectContaining({
+        body: JSON.stringify({
+          chat_id: "123",
+          text: "Switched session: Trip planning\nid: s_abc12345",
+          reply_to_message_id: 13,
+          allow_sending_without_reply: true,
+        }),
+      }),
+    );
+  });
 });
 
 function env(values: Partial<Env>) {

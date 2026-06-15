@@ -10,6 +10,7 @@ import type {
   LlmConfig,
   LlmModality,
   PendingToolApproval,
+  StoredChatSession,
   StoredMemory,
   StoredTask,
 } from "../types";
@@ -366,12 +367,19 @@ export function canRunTelegramCommand(
   incoming: Pick<IncomingTelegramText, "fromUserId">,
   env: Env,
 ) {
-  if (!command || !MUTATING_COMMANDS.has(command.name)) return true;
+  if (!command || !isMutatingTelegramCommand(command)) return true;
 
   const adminUserIds = parseTelegramAdminUserIds(env.TELEGRAM_ADMIN_USER_IDS);
   if (adminUserIds.size === 0) return true;
 
   return typeof incoming.fromUserId === "string" && adminUserIds.has(incoming.fromUserId);
+}
+
+function isMutatingTelegramCommand(command: SlashCommand) {
+  if (MUTATING_COMMANDS.has(command.name)) return true;
+  if (command.name !== "session") return false;
+  const action = firstArg(command.args);
+  return Boolean(action && action !== "list");
 }
 
 export function buildTelegramLlmConfig(env: Env): LlmConfig | Error {
@@ -621,6 +629,9 @@ async function handleAllowedTelegramMessage(
         incoming.messageId,
       );
       return;
+    case "session":
+      await handleSessionCommand(env, requestUrl, incoming, command);
+      return;
     case "stop":
     case "new":
     case "reset":
@@ -659,13 +670,15 @@ function helpText() {
     "/llmtest - test the active LLM profile",
     "/forget <memory_id> - delete a memory",
     "/pending - list pending tool approvals",
+    "/session - list or switch chat sessions",
+    "/session new [title] - start a new chat session",
     "/approve <id> - approve a pending tool call",
     "/deny <id> - deny a pending tool call",
     "/stop - cancel the active response in this chat",
-    "/new or /reset - stop the active response; no chat history is persisted",
+    "/new or /reset - clear the current chat context and stop any active response",
     "/id - show this Telegram chat id",
     "",
-    "Normal messages are not stored as chat history. Only bounded memory is persisted.",
+    "Chat history is persisted per session. Use /session to switch conversations.",
   ].join("\n");
 }
 
@@ -903,6 +916,73 @@ async function pendingApprovalsText(env: Env, requestUrl: string, chatId: string
   return approvals.map(formatPendingApproval).join("\n\n");
 }
 
+async function handleSessionCommand(
+  env: Env,
+  requestUrl: string,
+  incoming: IncomingTelegramText,
+  command: SlashCommand,
+) {
+  const args = command.args.split(/\s+/).map((arg) => arg.trim()).filter(Boolean);
+  const action = args[0]?.toLowerCase();
+
+  if (!action || action === "list") {
+    await sendTelegramMessage(
+      env,
+      incoming.chatId,
+      await sessionsText(env, requestUrl, incoming.chatId),
+      incoming.messageId,
+    );
+    return;
+  }
+
+  if (action === "new") {
+    await stopTelegramRun(env, requestUrl, incoming.chatId);
+    const title = args.slice(1).join(" ");
+    const session = await createTelegramChatSession(env, requestUrl, incoming.chatId, title);
+    await sendTelegramMessage(
+      env,
+      incoming.chatId,
+      formatSessionChanged("Started session", session),
+      incoming.messageId,
+    );
+    return;
+  }
+
+  const sessionId = action === "switch" || action === "use" ? args[1] : args[0];
+  if (!sessionId) {
+    await sendTelegramMessage(
+      env,
+      incoming.chatId,
+      "Usage: /session new [title] or /session <session_id>",
+      incoming.messageId,
+    );
+    return;
+  }
+
+  await stopTelegramRun(env, requestUrl, incoming.chatId);
+  const session = await switchTelegramChatSession(env, requestUrl, incoming.chatId, sessionId);
+  await sendTelegramMessage(
+    env,
+    incoming.chatId,
+    formatSessionChanged("Switched session", session),
+    incoming.messageId,
+  );
+}
+
+async function sessionsText(env: Env, requestUrl: string, chatId: string) {
+  const sessions = await fetchTelegramChatSessions(env, requestUrl, chatId);
+  if (sessions.length === 0) {
+    return "No chat sessions yet. Send a message or use /session new [title].";
+  }
+
+  return [
+    "Chat sessions:",
+    ...sessions.slice(0, 20).map(formatSessionLine),
+    "",
+    "Use /session new [title] or /session <session_id>.",
+  ].join("\n");
+}
+
 async function tasksText(env: Env, requestUrl: string, chatId: string) {
   const tasks = await fetchTasks(env, requestUrl, chatId, "pending");
   if (tasks.length === 0) return "No pending tasks.";
@@ -1041,22 +1121,31 @@ async function handleStopCommand(
   incoming: IncomingTelegramText,
   commandName: string,
 ) {
-  const body = await stopTelegramRun(env, requestUrl, incoming.chatId);
-  const label = commandName === "stop" ? "Stopped active response." : "Started a fresh turn.";
+  const resetConversation = commandName === "new" || commandName === "reset";
+  const body = await stopTelegramRun(env, requestUrl, incoming.chatId, resetConversation);
+  const label = commandName === "stop"
+    ? "Stopped active response."
+    : "Started a fresh conversation.";
   await sendTelegramMessage(
     env,
     incoming.chatId,
-    body.stopped ? label : "No active response in this chat.",
+    body.stopped || resetConversation ? label : "No active response in this chat.",
     incoming.messageId,
   );
 }
 
-async function stopTelegramRun(env: Env, requestUrl: string, chatId: string) {
+async function stopTelegramRun(
+  env: Env,
+  requestUrl: string,
+  chatId: string,
+  resetConversation = false,
+) {
   const response = await fetchAgentObject(env, requestUrl, "/sessions/stop", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       source: { channel: "telegram", chatId },
+      ...(resetConversation ? { resetConversation } : {}),
     }),
   });
   const body = (await response.json().catch(() => ({}))) as {
@@ -1880,6 +1969,70 @@ async function fetchPendingApprovals(env: Env, requestUrl: string, chatId: strin
   return body.approvals ?? [];
 }
 
+async function fetchTelegramChatSessions(
+  env: Env,
+  requestUrl: string,
+  chatId: string,
+) {
+  const params = new URLSearchParams({ channel: "telegram", chatId });
+  const response = await fetchAgentObject(env, requestUrl, `/chat-sessions?${params.toString()}`, {
+    method: "GET",
+  });
+  if (!response.ok) return [];
+  const body = (await response.json().catch(() => ({}))) as {
+    sessions?: StoredChatSession[];
+  };
+  return body.sessions ?? [];
+}
+
+async function createTelegramChatSession(
+  env: Env,
+  requestUrl: string,
+  chatId: string,
+  title?: string,
+) {
+  const response = await fetchAgentObject(env, requestUrl, "/chat-sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      source: { channel: "telegram", chatId },
+      ...(title?.trim() ? { title: title.trim() } : {}),
+    }),
+  });
+  const body = (await response.json().catch(() => ({}))) as {
+    session?: StoredChatSession;
+    error?: string;
+  };
+  if (!response.ok || body.error || !body.session) {
+    throw new Error(body.error || `Session create failed: ${response.status}`);
+  }
+  return body.session;
+}
+
+async function switchTelegramChatSession(
+  env: Env,
+  requestUrl: string,
+  chatId: string,
+  sessionId: string,
+) {
+  const response = await fetchAgentObject(env, requestUrl, "/chat-sessions/active", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      source: { channel: "telegram", chatId },
+      sessionId,
+    }),
+  });
+  const body = (await response.json().catch(() => ({}))) as {
+    session?: StoredChatSession;
+    error?: string;
+  };
+  if (!response.ok || body.error || !body.session) {
+    throw new Error(body.error || `Session switch failed: ${response.status}`);
+  }
+  return body.session;
+}
+
 async function fetchTasks(
   env: Env,
   requestUrl: string,
@@ -2453,6 +2606,15 @@ function formatPendingApproval(approval: PendingToolApproval) {
     `/approve ${approval.id}`,
     `/deny ${approval.id}`,
   ].join("\n");
+}
+
+function formatSessionLine(session: StoredChatSession) {
+  const marker = session.active ? "*" : "-";
+  return `${marker} ${session.id}: ${session.title}`;
+}
+
+function formatSessionChanged(prefix: string, session: StoredChatSession) {
+  return [`${prefix}: ${session.title}`, `id: ${session.id}`].join("\n");
 }
 
 function formatTask(task: StoredTask, timeZone: string | undefined) {

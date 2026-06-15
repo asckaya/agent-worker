@@ -9,11 +9,30 @@ interface HealthState {
 }
 
 const checks = [
-  { label: "Worker", value: "Cloudflare Workers" },
-  { label: "State", value: "DO SQLite bounded memory + in-memory run control" },
-  { label: "Channel", value: "Telegram + protected HTTP test channel" },
-  { label: "Model", value: "Vercel AI SDK + OpenAI-compatible adapter" },
-  { label: "Tools", value: "basic + arXiv/GitHub + approval-gated HTTP" },
+  { label: "Runtime", value: "Cloudflare Workers", detail: "Hono API routes" },
+  { label: "State", value: "Durable Object SQLite", detail: "Memory, sessions, approvals" },
+  { label: "Channel", value: "Telegram primary", detail: "Protected test channel enabled" },
+  { label: "Model", value: "OpenAI-compatible", detail: "Vercel AI SDK adapter" },
+  { label: "Tools", value: "Registry controlled", detail: "Approval-gated HTTP tools" },
+];
+
+const boundaries = [
+  {
+    label: "Persisted",
+    value: "Chat sessions, chat messages, curated memory, short-lived approvals, tasks, and non-secret LLM profile metadata.",
+  },
+  {
+    label: "Process memory",
+    value: "Active runs, approval continuations, paused approval sessions, and queued follow-up messages.",
+  },
+  {
+    label: "Protected",
+    value: "Telegram uses webhook secret and chat allowlist. Admin APIs use bearer token or signed cookie auth.",
+  },
+  {
+    label: "Excluded",
+    value: "No web chat UI is exposed. LLM credentials stay in Worker secrets or environment variables.",
+  },
 ];
 
 function App() {
@@ -41,59 +60,64 @@ function App() {
       });
   }, []);
 
+  const healthState = health.checkedAt === "checking" ? "pending" : health.ok ? "ok" : "error";
+  const healthLabel = healthState === "pending" ? "checking" : health.ok ? "online" : "attention";
+
   return (
     <main className="status-shell">
       <section className="status-header">
         <div>
+          <p className="eyebrow">Status page</p>
           <h1>Agent Worker</h1>
-          <p>Runtime status for the Telegram-first personal agent.</p>
+          <p className="lede">Telegram-first personal agent runtime and data boundary overview.</p>
         </div>
-        <span className={health.ok ? "status-pill ok" : "status-pill error"}>
-          {health.ok ? "online" : "check failed"}
+        <span className={`status-pill ${healthState}`}>
+          <span className="status-dot" />
+          {healthLabel}
         </span>
+      </section>
+
+      <section className="health-strip" aria-label="Health">
+        <div>
+          <span>API</span>
+          <strong>{health.ok ? "/api/health OK" : health.error ?? "checking"}</strong>
+        </div>
+        <div>
+          <span>Checked</span>
+          <strong>{health.checkedAt}</strong>
+        </div>
+        <div>
+          <span>Webhook</span>
+          <strong>/api/tg/webhook</strong>
+        </div>
       </section>
 
       <section className="status-grid">
         <article className="status-panel">
-          <h2>Health</h2>
-          <dl>
-            <div>
-              <dt>API</dt>
-              <dd>{health.ok ? "/api/health OK" : health.error ?? "checking"}</dd>
-            </div>
-            <div>
-              <dt>Checked</dt>
-              <dd>{health.checkedAt}</dd>
-            </div>
-            <div>
-              <dt>Telegram webhook</dt>
-              <dd>/api/tg/webhook</dd>
-            </div>
-          </dl>
+          <h2>Runtime Stack</h2>
+          <div className="stack-list">
+            {checks.map((check) => (
+              <div className="stack-row" key={check.label}>
+                <span>{check.label}</span>
+                <div>
+                  <strong>{check.value}</strong>
+                  <small>{check.detail}</small>
+                </div>
+              </div>
+            ))}
+          </div>
         </article>
 
         <article className="status-panel">
-          <h2>Architecture</h2>
-          <dl>
-            {checks.map((check) => (
-              <div key={check.label}>
-                <dt>{check.label}</dt>
-                <dd>{check.value}</dd>
-              </div>
-            ))}
-          </dl>
-        </article>
-
-        <article className="status-panel wide">
           <h2>Data Boundary</h2>
-          <ul>
-            <li>No web chat UI is exposed.</li>
-            <li>Telegram messages are not stored as conversation history.</li>
-            <li>Durable Object SQLite persists bounded memory, short-lived approvals, and non-secret LLM profile overrides.</li>
-            <li>Active runs, approval continuations, paused approvals, and queued follow-ups are process-memory state.</li>
-            <li>LLM credentials for Telegram stay in Worker secrets/env vars.</li>
-            <li>Admin APIs remain protected by signed cookie auth.</li>
-          </ul>
+          <div className="boundary-list">
+            {boundaries.map((item) => (
+              <section key={item.label}>
+                <h3>{item.label}</h3>
+                <p>{item.value}</p>
+              </section>
+            ))}
+          </div>
         </article>
       </section>
     </main>

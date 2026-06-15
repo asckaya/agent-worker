@@ -17,6 +17,7 @@ const responseFormatSchema = z.enum(["sse", "json"]).optional();
 
 const TestChatRequestSchema = z.object({
   chatId: z.string().trim().min(1).max(128).optional().default(TEST_CHANNEL_DEFAULT_CHAT_ID),
+  sessionId: z.string().trim().min(1).max(64).optional(),
   message: z
     .string()
     .trim()
@@ -29,6 +30,15 @@ const TestChatRequestSchema = z.object({
 
 const TestControlRequestSchema = z.object({
   chatId: z.string().trim().min(1).max(128).optional().default(TEST_CHANNEL_DEFAULT_CHAT_ID),
+  resetConversation: z.boolean().optional().default(false),
+});
+
+const TestSessionCreateRequestSchema = TestControlRequestSchema.extend({
+  title: z.string().trim().max(200).optional(),
+});
+
+const TestSessionSwitchRequestSchema = TestControlRequestSchema.extend({
+  sessionId: z.string().trim().min(1).max(64),
 });
 
 const TestMemoryRequestSchema = z.object({
@@ -92,6 +102,11 @@ async function routeTestChannelRequest(request: Request, env: Env) {
         "POST /api/test-channel/approvals/:id/approve",
         "POST /api/test-channel/approvals/:id/deny",
         "POST /api/test-channel/stop",
+        "POST /api/test-channel/new",
+        "POST /api/test-channel/reset",
+        "GET /api/test-channel/sessions?chatId=default",
+        "POST /api/test-channel/sessions",
+        "POST /api/test-channel/sessions/active",
         "GET /api/test-channel/approvals?chatId=default",
         "GET /api/test-channel/state",
         "POST /api/test-channel/memories",
@@ -121,9 +136,34 @@ async function routeTestChannelRequest(request: Request, env: Env) {
 
   if (
     request.method === "POST" &&
-    (url.pathname.endsWith("/stop") || url.pathname.endsWith("/sessions/stop"))
+    (url.pathname.endsWith("/stop") ||
+      url.pathname.endsWith("/sessions/stop") ||
+      url.pathname.endsWith("/new") ||
+      url.pathname.endsWith("/reset"))
   ) {
-    return handleTestStop(request, env);
+    return handleTestStop(
+      request,
+      env,
+      url.pathname.endsWith("/new") || url.pathname.endsWith("/reset"),
+    );
+  }
+
+  if (request.method === "GET" && url.pathname.endsWith("/sessions")) {
+    const chatId = url.searchParams.get("chatId")?.trim() || TEST_CHANNEL_DEFAULT_CHAT_ID;
+    return fetchAgentObject(
+      env,
+      request.url,
+      `/chat-sessions?channel=${TEST_CHANNEL_NAME}&chatId=${encodeURIComponent(chatId)}`,
+      { method: "GET" },
+    );
+  }
+
+  if (request.method === "POST" && url.pathname.endsWith("/sessions")) {
+    return handleTestCreateSession(request, env);
+  }
+
+  if (request.method === "POST" && url.pathname.endsWith("/sessions/active")) {
+    return handleTestSwitchSession(request, env);
   }
 
   if (request.method === "GET" && url.pathname.endsWith("/approvals")) {
@@ -233,6 +273,7 @@ async function handleTestChat(request: Request, env: Env) {
       history: payload.history,
       llm,
       source: { channel: TEST_CHANNEL_NAME, chatId: payload.chatId },
+      ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
     }),
   });
 
@@ -275,13 +316,38 @@ async function handleTestDeny(request: Request, env: Env, approvalId: string) {
   );
 }
 
-async function handleTestStop(request: Request, env: Env) {
+async function handleTestStop(request: Request, env: Env, resetConversation = false) {
   const payload = await parseJsonBody(request, TestControlRequestSchema);
   return fetchAgentObject(env, request.url, "/sessions/stop", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       source: { channel: TEST_CHANNEL_NAME, chatId: payload.chatId },
+      resetConversation: resetConversation || payload.resetConversation,
+    }),
+  });
+}
+
+async function handleTestCreateSession(request: Request, env: Env) {
+  const payload = await parseJsonBody(request, TestSessionCreateRequestSchema);
+  return fetchAgentObject(env, request.url, "/chat-sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      source: { channel: TEST_CHANNEL_NAME, chatId: payload.chatId },
+      ...(payload.title ? { title: payload.title } : {}),
+    }),
+  });
+}
+
+async function handleTestSwitchSession(request: Request, env: Env) {
+  const payload = await parseJsonBody(request, TestSessionSwitchRequestSchema);
+  return fetchAgentObject(env, request.url, "/chat-sessions/active", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      source: { channel: TEST_CHANNEL_NAME, chatId: payload.chatId },
+      sessionId: payload.sessionId,
     }),
   });
 }

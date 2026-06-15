@@ -115,6 +115,93 @@ describe("test channel", () => {
     });
   });
 
+  it("routes reset requests as stop plus conversation reset", async () => {
+    let agentPath = "";
+    let agentBody: unknown;
+    const agentFetch = vi.fn(async (request: Request) => {
+      agentPath = new URL(request.url).pathname;
+      agentBody = await request.json();
+      return Response.json({ ok: true, stopped: false, conversationReset: true });
+    });
+
+    const response = await handleTestChannelRequest(
+      jsonRequest("/api/test-channel/reset", {
+        chatId: "local",
+      }),
+      env({ AGENT_OBJECT: agentNamespace(agentFetch) }),
+    );
+
+    expect(agentPath).toBe("/sessions/stop");
+    expect(agentBody).toEqual({
+      source: { channel: "test", chatId: "local" },
+      resetConversation: true,
+    });
+    await expect(response.json()).resolves.toMatchObject({
+      ok: true,
+      conversationReset: true,
+    });
+  });
+
+  it("proxies chat session management endpoints", async () => {
+    const calls: Array<{ path: string; search: string; body?: unknown; method: string }> = [];
+    const agentFetch = vi.fn(async (request: Request) => {
+      const url = new URL(request.url);
+      calls.push({
+        path: url.pathname,
+        search: url.search,
+        method: request.method,
+        body: request.method === "GET" ? undefined : await request.json(),
+      });
+      return Response.json({ ok: true, sessions: [], session: { id: "s_1" } });
+    });
+
+    await handleTestChannelRequest(
+      new Request("https://example.com/api/test-channel/sessions?chatId=local"),
+      env({ AGENT_OBJECT: agentNamespace(agentFetch) }),
+    );
+    await handleTestChannelRequest(
+      jsonRequest("/api/test-channel/sessions", {
+        chatId: "local",
+        title: "planning",
+      }),
+      env({ AGENT_OBJECT: agentNamespace(agentFetch) }),
+    );
+    await handleTestChannelRequest(
+      jsonRequest("/api/test-channel/sessions/active", {
+        chatId: "local",
+        sessionId: "s_1",
+      }),
+      env({ AGENT_OBJECT: agentNamespace(agentFetch) }),
+    );
+
+    expect(calls).toEqual([
+      {
+        path: "/chat-sessions",
+        search: "?channel=test&chatId=local",
+        method: "GET",
+        body: undefined,
+      },
+      {
+        path: "/chat-sessions",
+        search: "",
+        method: "POST",
+        body: {
+          source: { channel: "test", chatId: "local" },
+          title: "planning",
+        },
+      },
+      {
+        path: "/chat-sessions/active",
+        search: "",
+        method: "POST",
+        body: {
+          source: { channel: "test", chatId: "local" },
+          sessionId: "s_1",
+        },
+      },
+    ]);
+  });
+
   it("proxies memory and task management endpoints", async () => {
     const calls: Array<{ path: string; body?: unknown; method: string }> = [];
     const agentFetch = vi.fn(async (request: Request) => {
