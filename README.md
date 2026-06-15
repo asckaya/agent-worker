@@ -2,7 +2,7 @@
 
 Cloudflare Worker personal agent focused on non-coding workflows. The MVP uses Cloudflare Workers, Durable Objects SQLite, Hono, React status page, Vercel AI SDK, zod, and server-side OpenAI-compatible LLM credentials for Telegram.
 
-The runtime is split into `model / tool / channel` layers. Telegram is the first real channel and supports slash commands, inline menu buttons, private-chat draft streaming with edit-message fallback, typing refresh, short text batching, text-file handling, reminders/tasks, interruptible active-run follow-up queueing, MarkdownV2 final-message fallback, and `/approve` tool approval with inline buttons. A protected HTTP test channel is also available for local/manual testing without Telegram.
+The runtime is split into `model / tool / channel` layers. Telegram is the first real channel and supports slash commands, inline menu buttons, private-chat draft streaming with edit-message fallback, typing refresh, short text batching, text/image/PDF/MP3/WAV file handling, reminders/tasks, interruptible active-run follow-up queueing, MarkdownV2 final-message fallback, and `/approve` tool approval with inline buttons. A protected HTTP test channel is also available for local/manual testing without Telegram.
 
 ## Data Boundary
 
@@ -13,6 +13,7 @@ The runtime is split into `model / tool / channel` layers. Telegram is the first
 - Telegram uses server-side LLM secrets/env vars because it has no browser-local key store.
 - LLM API keys are Worker secrets/env bindings only; they are not stored in Durable Object SQLite, docs, or client state.
 - Memory is capped at 200 items and 1200 characters per item. Tasks are capped at 200 items.
+- Telegram media files are never persisted. Supported media is downloaded only for the current turn and sent to the active model as bounded request content.
 
 ## Tooling
 
@@ -93,6 +94,7 @@ TELEGRAM_TIME_ZONE=Asia/Shanghai
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_API_KEY=...
 LLM_MODEL=gpt-4.1-mini
+LLM_MODALITIES=text
 ```
 
 For one model, `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL` are enough. For multiple models, keep API keys in separate Worker secrets and store only profile metadata in `LLM_PROFILES_JSON` or through the protected LLM settings API:
@@ -107,6 +109,7 @@ For one model, `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL` are enough. For mu
       "baseUrl": "https://openrouter.ai/api/v1",
       "model": "google/gemma-4-31b-it:free",
       "apiKeyEnv": "OPENROUTER_API_KEY",
+      "modalities": ["text"],
       "maxTokens": 16384,
       "extraHeaders": {
         "HTTP-Referer": "https://YOUR_WORKER_DOMAIN",
@@ -118,6 +121,15 @@ For one model, `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL` are enough. For mu
 ```
 
 `apiKeyEnv` is the Worker secret/env binding name to read at runtime. Do not put the actual API key in the profile JSON. Secret-bearing headers such as `Authorization` and `X-API-Key` are rejected in `extraHeaders`; use `apiKeyEnv` instead.
+
+`modalities` is an explicit capability declaration used before Telegram sends media to a model. Default is `["text"]`. Add `image`, `audio`, or `pdf` only after confirming that the selected provider/model supports that input type through the OpenAI-compatible API. Telegram rejects unsupported media before calling the provider. Current OpenAI-compatible serialization supports:
+
+- `image`: Telegram photos and image documents.
+- `audio`: MP3 and WAV only.
+- `pdf`: PDF documents.
+- `text`: text-like documents are converted into current-turn text.
+
+Video and Telegram OGG/Opus voice messages are intentionally blocked for now because the current OpenAI-compatible adapter does not serialize them reliably.
 
 For Cloudflare AI Gateway, either set `baseUrl` directly to the Gateway provider endpoint, or use first-class `aiGateway` metadata:
 
@@ -134,7 +146,8 @@ For Cloudflare AI Gateway, either set `baseUrl` directly to the Gateway provider
         "provider": "openrouter"
       },
       "model": "openai/gpt-5-mini",
-      "apiKeyEnv": "OPENROUTER_API_KEY"
+      "apiKeyEnv": "OPENROUTER_API_KEY",
+      "modalities": ["text", "image"]
     }
   ]
 }
@@ -167,7 +180,7 @@ wrangler secret put LLM_API_KEY
 wrangler secret put OPENROUTER_API_KEY
 ```
 
-User-specific runtime settings such as `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_ADMIN_USER_IDS`, `TELEGRAM_TIME_ZONE`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_TEMPERATURE`, `LLM_MAX_TOKENS`, and `LLM_PROFILES_JSON` can be set in the Cloudflare Dashboard under Worker variables and secrets. `wrangler.jsonc` sets `keep_vars: true` so Git/CLI deploys preserve Dashboard-managed runtime configuration instead of deleting it.
+User-specific runtime settings such as `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_ADMIN_USER_IDS`, `TELEGRAM_TIME_ZONE`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_TEMPERATURE`, `LLM_MAX_TOKENS`, `LLM_MODALITIES`, and `LLM_PROFILES_JSON` can be set in the Cloudflare Dashboard under Worker variables and secrets. `wrangler.jsonc` sets `keep_vars: true` so Git/CLI deploys preserve Dashboard-managed runtime configuration instead of deleting it.
 
 Wrangler local dev reads `.dev.vars`; use that instead of `.env` for local Worker secrets. For production, use Worker secrets for sensitive values and plain variables only for non-secret allowlists/profile metadata.
 

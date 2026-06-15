@@ -5,8 +5,10 @@ import { readServerSentEvents } from "./sse";
 import type { AgentStreamEvent, ChannelAdapter, ChannelCapabilities } from "./types";
 import type {
   ActiveAgentRun,
+  ChatContentPart,
   Env,
   LlmConfig,
+  LlmModality,
   PendingToolApproval,
   StoredMemory,
   StoredTask,
@@ -30,6 +32,7 @@ const TELEGRAM_TEXT_BATCH_MAX_MESSAGES = 6;
 const TELEGRAM_TEXT_BATCH_MAX_CHARS = 16_000;
 const TELEGRAM_FILE_MAX_BYTES = 256 * 1024;
 const TELEGRAM_FILE_MAX_TEXT_CHARS = 12_000;
+const TELEGRAM_MEDIA_MAX_BYTES = 4 * 1024 * 1024;
 const TELEGRAM_DEFAULT_TIME_ZONE = "Asia/Shanghai";
 const MUTATING_COMMANDS = new Set([
   "approve",
@@ -60,6 +63,10 @@ interface TelegramMessage {
   text?: string;
   caption?: string;
   document?: TelegramDocument;
+  photo?: TelegramPhotoSize[];
+  audio?: TelegramMediaFile;
+  voice?: TelegramMediaFile;
+  video?: TelegramMediaFile;
   chat: {
     id: string;
     type: string;
@@ -76,6 +83,17 @@ interface TelegramDocument {
   file_name?: string;
   mime_type?: string;
   file_size?: number;
+}
+
+interface TelegramPhotoSize {
+  file_id: string;
+  file_size?: number;
+  width?: number;
+  height?: number;
+}
+
+interface TelegramMediaFile extends TelegramDocument {
+  duration?: number;
 }
 
 interface TelegramCallbackQuery {
@@ -95,6 +113,7 @@ interface IncomingTelegramText {
   fromUserId?: string;
   messageId: number;
   text: string;
+  attachments?: ChatContentPart[];
 }
 
 interface IncomingTelegramCallback extends IncomingTelegramText {
@@ -107,6 +126,7 @@ interface IncomingTelegramFile {
   chatType: string;
   fromUserId?: string;
   messageId: number;
+  kind: "document" | "photo" | "audio" | "voice" | "video";
   fileId: string;
   fileName?: string;
   mimeType?: string;
@@ -168,6 +188,7 @@ interface LlmSettingsSummaryProfile {
   hasApiKey: boolean;
   temperature?: number;
   maxTokens?: number;
+  modalities?: LlmModality[];
 }
 
 interface LlmSettingsResponse {
@@ -803,6 +824,7 @@ async function llmSettingsText(env: Env, requestUrl: string) {
         profile.name ? `name: ${profile.name}` : "",
         `model: ${profile.model}`,
         `baseUrl: ${profile.baseUrl}`,
+        `modalities: ${profile.modalities?.join(", ") || "text"}`,
         `secret: ${profile.apiKeyEnv} (${key})`,
         limits.join(", "),
       ].filter(Boolean).join("\n");
@@ -1174,6 +1196,7 @@ async function handleAgentMessage(env: Env, requestUrl: string, incoming: Incomi
     "/chat",
     {
       message: incoming.text,
+      ...(incoming.attachments?.length ? { attachments: incoming.attachments } : {}),
       llm,
       source: { channel: "telegram", chatId: incoming.chatId },
     },
@@ -1186,21 +1209,75 @@ async function handleAllowedTelegramFile(
   env: Env,
   incoming: IncomingTelegramFile,
 ) {
-  const fileCheck = validateTelegramTextFile(incoming);
-  if (fileCheck instanceof Error) {
-    await sendTelegramMessage(env, incoming.chatId, fileCheck.message, incoming.messageId);
+  const classification = classifyTelegramFile(incoming);
+  if (classification instanceof Error) {
+    await sendTelegramMessage(env, incoming.chatId, classification.message, incoming.messageId);
     return;
   }
 
-  const fileText = await downloadTelegramTextFile(env, incoming);
-  const message = formatTelegramFilePrompt(incoming, fileText);
-  await handleAgentMessage(env, requestUrl, {
-    chatId: incoming.chatId,
-    chatType: incoming.chatType,
-    fromUserId: incoming.fromUserId,
-    messageId: incoming.messageId,
-    text: message,
-  });
+  const llm = await resolveRequiredChannelLlm(env, requestUrl, undefined, "Telegram");
+  if (llm instanceof Error) {
+    await sendTelegramMessage(env, incoming.chatId, llm.message, incoming.messageId);
+    return;
+  }
+
+  if (classification.kind !== "text" && !llmSupportsModality(llm, classification.modality)) {
+    await sendTelegramMessage(
+      env,
+      incoming.chatId,
+      unsupportedModalityMessage(classification.modality, llm),
+      incoming.messageId,
+    );
+    return;
+  }
+
+  const downloaded = await downloadTelegramFileBytes(env, incoming, classification.maxBytes);
+  if (classification.kind === "text") {
+    const fileText = new TextDecoder("utf-8", { fatal: false }).decode(downloaded.bytes);
+    const message = formatTelegramFilePrompt(incoming, fileText);
+    await streamAgentEndpointToTelegram(
+      env,
+      requestUrl,
+      {
+        chatId: incoming.chatId,
+        chatType: incoming.chatType,
+        fromUserId: incoming.fromUserId,
+        messageId: incoming.messageId,
+        text: message,
+      },
+      "/chat",
+      {
+        message,
+        llm,
+        source: { channel: "telegram", chatId: incoming.chatId },
+      },
+      "Reading file...",
+    );
+    return;
+  }
+
+  const attachment = telegramFileAttachment(incoming, classification, downloaded.bytes);
+  const message = formatTelegramMediaPrompt(incoming, classification);
+  await streamAgentEndpointToTelegram(
+    env,
+    requestUrl,
+    {
+      chatId: incoming.chatId,
+      chatType: incoming.chatType,
+      fromUserId: incoming.fromUserId,
+      messageId: incoming.messageId,
+      text: message,
+      attachments: [attachment],
+    },
+    "/chat",
+    {
+      message,
+      attachments: [attachment],
+      llm,
+      source: { channel: "telegram", chatId: incoming.chatId },
+    },
+    "Reading file...",
+  );
 }
 
 async function streamAgentEndpointToTelegram(
@@ -1555,19 +1632,72 @@ function extractTelegramText(update: TelegramUpdate): IncomingTelegramText | nul
 
 function extractTelegramFile(update: TelegramUpdate): IncomingTelegramFile | null {
   const message = update.message;
-  const document = message?.document;
-  if (!message || !document?.file_id) return null;
+  if (!message) return null;
 
-  return {
+  const base = {
     chatId: message.chat.id,
     chatType: message.chat.type,
     fromUserId: typeof message.from?.id === "number" ? String(message.from.id) : undefined,
     messageId: message.message_id,
+    caption: message.caption,
+  };
+
+  const photo = bestTelegramPhoto(message.photo);
+  if (photo) {
+    return {
+      ...base,
+      kind: "photo",
+      fileId: photo.file_id,
+      fileName: "telegram-photo.jpg",
+      mimeType: "image/jpeg",
+      fileSize: photo.file_size,
+    };
+  }
+
+  if (message.audio?.file_id) {
+    return telegramMediaToIncomingFile(base, "audio", message.audio);
+  }
+
+  if (message.voice?.file_id) {
+    return telegramMediaToIncomingFile(base, "voice", message.voice);
+  }
+
+  if (message.video?.file_id) {
+    return telegramMediaToIncomingFile(base, "video", message.video);
+  }
+
+  const document = message.document;
+  if (!document?.file_id) return null;
+
+  return {
+    ...base,
+    kind: "document",
     fileId: document.file_id,
     fileName: document.file_name,
     mimeType: document.mime_type,
     fileSize: document.file_size,
-    caption: message.caption,
+  };
+}
+
+function bestTelegramPhoto(photo: TelegramPhotoSize[] | undefined) {
+  if (!photo?.length) return null;
+  return photo
+    .slice()
+    .sort((left, right) => (right.file_size ?? 0) - (left.file_size ?? 0))[0];
+}
+
+function telegramMediaToIncomingFile(
+  base: Omit<IncomingTelegramFile, "kind" | "fileId">,
+  kind: IncomingTelegramFile["kind"],
+  file: TelegramMediaFile,
+): IncomingTelegramFile {
+  return {
+    ...base,
+    kind,
+    fileId: file.file_id,
+    fileName: file.file_name,
+    mimeType: file.mime_type,
+    fileSize: file.file_size,
   };
 }
 
@@ -1948,14 +2078,62 @@ async function sendTelegramDraft(env: Env, chatId: string, draftId: string, text
   });
 }
 
-function validateTelegramTextFile(file: IncomingTelegramFile) {
-  if (typeof file.fileSize === "number" && file.fileSize > TELEGRAM_FILE_MAX_BYTES) {
-    return new Error(`Text files must be ${Math.round(TELEGRAM_FILE_MAX_BYTES / 1024)}KB or smaller.`);
+type TelegramFileClassification =
+  | {
+      kind: "text";
+      maxBytes: number;
+      mediaType: string;
+    }
+  | {
+      kind: "image" | "audio" | "pdf";
+      modality: LlmModality;
+      maxBytes: number;
+      mediaType: string;
+    };
+
+function classifyTelegramFile(file: IncomingTelegramFile): TelegramFileClassification | Error {
+  if (file.kind === "video") {
+    return new Error(
+      "Video input is not supported by the current OpenAI-compatible adapter yet. Send an image, PDF, MP3, WAV, or text file.",
+    );
   }
-  if (!isSupportedTelegramTextFile(file)) {
-    return new Error("Only text, Markdown, JSON, CSV, YAML, XML, and log files are supported for now.");
+
+  if (isSupportedTelegramTextFile(file)) {
+    return { kind: "text", maxBytes: TELEGRAM_FILE_MAX_BYTES, mediaType: file.mimeType ?? "text/plain" };
   }
-  return null;
+
+  if (isTelegramImage(file)) {
+    return {
+      kind: "image",
+      modality: "image",
+      maxBytes: TELEGRAM_MEDIA_MAX_BYTES,
+      mediaType: file.mimeType ?? "image/jpeg",
+    };
+  }
+
+  if (isTelegramPdf(file)) {
+    return {
+      kind: "pdf",
+      modality: "pdf",
+      maxBytes: TELEGRAM_MEDIA_MAX_BYTES,
+      mediaType: "application/pdf",
+    };
+  }
+
+  if (isTelegramSupportedAudio(file)) {
+    return {
+      kind: "audio",
+      modality: "audio",
+      maxBytes: TELEGRAM_MEDIA_MAX_BYTES,
+      mediaType: normalizeAudioMimeType(file.mimeType),
+    };
+  }
+
+  if (file.kind === "voice") {
+    return new Error("Telegram voice messages are usually OGG/Opus. Send MP3 or WAV audio for model input.");
+  }
+
+  return new Error("Unsupported file type. Supported: text, image, PDF, MP3, and WAV.");
 }
 
 function isSupportedTelegramTextFile(file: Pick<IncomingTelegramFile, "fileName" | "mimeType">) {
@@ -1977,15 +2155,50 @@ function isSupportedTelegramTextFile(file: Pick<IncomingTelegramFile, "fileName"
   return /\.(txt|md|markdown|json|jsonl|csv|tsv|yaml|yml|xml|toml|log)$/i.test(name);
 }
 
-async function downloadTelegramTextFile(env: Env, file: IncomingTelegramFile) {
+function isTelegramImage(file: Pick<IncomingTelegramFile, "kind" | "fileName" | "mimeType">) {
+  const mime = file.mimeType?.toLowerCase() ?? "";
+  const name = file.fileName?.toLowerCase() ?? "";
+  return file.kind === "photo" || mime.startsWith("image/") || /\.(jpg|jpeg|png|webp|gif)$/i.test(name);
+}
+
+function isTelegramPdf(file: Pick<IncomingTelegramFile, "fileName" | "mimeType">) {
+  const mime = file.mimeType?.toLowerCase() ?? "";
+  const name = file.fileName?.toLowerCase() ?? "";
+  return mime === "application/pdf" || name.endsWith(".pdf");
+}
+
+function isTelegramSupportedAudio(file: Pick<IncomingTelegramFile, "kind" | "fileName" | "mimeType">) {
+  if (file.kind !== "audio" && file.kind !== "document") return false;
+  const mime = file.mimeType?.toLowerCase() ?? "";
+  const name = file.fileName?.toLowerCase() ?? "";
+  return (
+    mime === "audio/mpeg" ||
+    mime === "audio/mp3" ||
+    mime === "audio/wav" ||
+    mime === "audio/x-wav" ||
+    /\.(mp3|wav)$/i.test(name)
+  );
+}
+
+function normalizeAudioMimeType(value: string | undefined) {
+  const mime = value?.toLowerCase();
+  if (mime === "audio/wav" || mime === "audio/x-wav") return "audio/wav";
+  return "audio/mpeg";
+}
+
+async function downloadTelegramFileBytes(env: Env, file: IncomingTelegramFile, maxBytes: number) {
+  if (typeof file.fileSize === "number" && file.fileSize > maxBytes) {
+    throw new Error(`Files of this type must be ${formatBytes(maxBytes)} or smaller.`);
+  }
+
   const info = await telegramApi<{ file_path?: string; file_size?: number }>(env, "getFile", {
     file_id: file.fileId,
   });
   if (!info?.file_path) {
     throw new Error("Telegram did not return a file path.");
   }
-  if (typeof info.file_size === "number" && info.file_size > TELEGRAM_FILE_MAX_BYTES) {
-    throw new Error(`Text files must be ${Math.round(TELEGRAM_FILE_MAX_BYTES / 1024)}KB or smaller.`);
+  if (typeof info.file_size === "number" && info.file_size > maxBytes) {
+    throw new Error(`Files of this type must be ${formatBytes(maxBytes)} or smaller.`);
   }
 
   const token = env.TELEGRAM_BOT_TOKEN?.trim();
@@ -1995,15 +2208,78 @@ async function downloadTelegramTextFile(env: Env, file: IncomingTelegramFile) {
     throw new Error(`Telegram file download failed: ${response.status}`);
   }
   const contentLength = Number(response.headers.get("Content-Length"));
-  if (Number.isFinite(contentLength) && contentLength > TELEGRAM_FILE_MAX_BYTES) {
-    throw new Error(`Text files must be ${Math.round(TELEGRAM_FILE_MAX_BYTES / 1024)}KB or smaller.`);
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    throw new Error(`Files of this type must be ${formatBytes(maxBytes)} or smaller.`);
   }
 
   const bytes = await response.arrayBuffer();
-  if (bytes.byteLength > TELEGRAM_FILE_MAX_BYTES) {
-    throw new Error(`Text files must be ${Math.round(TELEGRAM_FILE_MAX_BYTES / 1024)}KB or smaller.`);
+  if (bytes.byteLength > maxBytes) {
+    throw new Error(`Files of this type must be ${formatBytes(maxBytes)} or smaller.`);
   }
-  return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+  return { bytes };
+}
+
+function telegramFileAttachment(
+  file: IncomingTelegramFile,
+  classification: Exclude<TelegramFileClassification, { kind: "text" }>,
+  bytes: ArrayBuffer,
+): ChatContentPart {
+  const data = dataUrl(classification.mediaType, bytes);
+  if (classification.kind === "image") {
+    return {
+      type: "image",
+      data,
+      mediaType: classification.mediaType,
+      filename: file.fileName,
+    };
+  }
+
+  return {
+    type: "file",
+    data,
+    mediaType: classification.mediaType,
+    filename: file.fileName ?? defaultAttachmentFilename(classification),
+  };
+}
+
+function dataUrl(mediaType: string, bytes: ArrayBuffer) {
+  return `data:${mediaType};base64,${arrayBufferToBase64(bytes)}`;
+}
+
+function arrayBufferToBase64(bytes: ArrayBuffer) {
+  let binary = "";
+  const view = new Uint8Array(bytes);
+  const chunkSize = 0x8000;
+  for (let index = 0; index < view.length; index += chunkSize) {
+    binary += String.fromCharCode(...view.slice(index, index + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function defaultAttachmentFilename(classification: Exclude<TelegramFileClassification, { kind: "text" }>) {
+  if (classification.kind === "pdf") return "document.pdf";
+  if (classification.mediaType === "audio/wav") return "audio.wav";
+  return "audio.mp3";
+}
+
+function formatBytes(bytes: number) {
+  return bytes >= 1024 * 1024
+    ? `${Math.round(bytes / 1024 / 1024)}MB`
+    : `${Math.round(bytes / 1024)}KB`;
+}
+
+function llmSupportsModality(llm: LlmConfig, modality: LlmModality) {
+  return llm.modalities?.includes(modality) ?? false;
+}
+
+function unsupportedModalityMessage(modality: LlmModality, llm: LlmConfig) {
+  const declared = llm.modalities?.join(", ") || "text";
+  return [
+    `The active model profile does not declare ${modality} support.`,
+    `Model: ${llm.model}`,
+    `Declared modalities: ${declared}`,
+    `Add "modalities": ["text", "${modality}"] to the active LLM profile after confirming the model supports it.`,
+  ].join("\n");
 }
 
 function formatTelegramFilePrompt(file: IncomingTelegramFile, content: string) {
@@ -2020,6 +2296,27 @@ function formatTelegramFilePrompt(file: IncomingTelegramFile, content: string) {
     trimmed,
     content.length > trimmed.length ? "\n[truncated]" : "",
   ].filter((line) => line !== "").join("\n");
+}
+
+function formatTelegramMediaPrompt(
+  file: IncomingTelegramFile,
+  classification: Exclude<TelegramFileClassification, { kind: "text" }>,
+) {
+  const instruction = file.caption?.trim() || defaultMediaInstruction(classification.kind);
+  return [
+    `User instruction: ${instruction}`,
+    "",
+    `Attachment: ${file.fileName ?? file.kind}`,
+    `Type: ${classification.kind}`,
+    `MIME: ${classification.mediaType}`,
+    typeof file.fileSize === "number" ? `Size: ${file.fileSize} bytes` : "",
+  ].filter((line) => line !== "").join("\n");
+}
+
+function defaultMediaInstruction(kind: Exclude<TelegramFileClassification, { kind: "text" }>["kind"]) {
+  if (kind === "image") return "Describe this image and answer any visible question.";
+  if (kind === "audio") return "Analyze this audio and summarize the important content.";
+  return "Analyze this PDF and summarize the important content.";
 }
 
 async function telegramApi<T>(env: Env, method: string, payload: Record<string, unknown>) {

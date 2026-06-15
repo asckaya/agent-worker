@@ -650,6 +650,134 @@ describe("telegram integration", () => {
     expect((agentRequestBody as { message: string }).message).toContain("hello from a file");
   });
 
+  it("blocks Telegram images when the active LLM profile does not declare image support", async () => {
+    const telegramFetch = vi.fn(async () =>
+      Response.json({ ok: true, result: { message_id: 42 } }),
+    );
+    vi.stubGlobal("fetch", telegramFetch);
+    const agentFetch = vi.fn(async () => {
+      throw new Error("Unexpected agent chat call.");
+    });
+
+    await handleTelegramWebhook(
+      webhookRequest({
+        message: {
+          message_id: 19,
+          photo: [{ file_id: "photo-1", file_size: 1200, width: 32, height: 32 }],
+          chat: { id: 123, type: "private" },
+        },
+      }),
+      env({
+        TELEGRAM_SECRET_TOKEN: "secret",
+        TELEGRAM_BOT_TOKEN: "bot-token",
+        TELEGRAM_ALLOWED_CHAT_IDS: "123",
+        LLM_BASE_URL: "https://api.openai.com/v1",
+        LLM_API_KEY: "key",
+        LLM_MODEL: "gpt-test",
+        AGENT_OBJECT: agentNamespace(agentFetch),
+      }),
+    );
+
+    expect(agentFetch).not.toHaveBeenCalled();
+    expect(telegramFetch).toHaveBeenCalledWith(
+      "https://api.telegram.org/botbot-token/sendMessage",
+      expect.objectContaining({
+        body: JSON.stringify({
+          chat_id: "123",
+          text: [
+            "The active model profile does not declare image support.",
+            "Model: gpt-test",
+            "Declared modalities: text",
+            'Add "modalities": ["text", "image"] to the active LLM profile after confirming the model supports it.',
+          ].join("\n"),
+          reply_to_message_id: 19,
+          allow_sending_without_reply: true,
+        }),
+      }),
+    );
+    expect(telegramFetch).not.toHaveBeenCalledWith(
+      "https://api.telegram.org/botbot-token/getFile",
+      expect.anything(),
+    );
+  });
+
+  it("passes Telegram images to the agent when the active LLM profile declares image support", async () => {
+    const imageBytes = new Uint8Array([137, 80, 78, 71]);
+    const telegramFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith("/getFile")) {
+        return Response.json({ ok: true, result: { file_path: "photos/pic.jpg", file_size: 4 } });
+      }
+      if (url === "https://api.telegram.org/file/botbot-token/photos/pic.jpg") {
+        return new Response(imageBytes, {
+          headers: { "Content-Type": "image/jpeg", "Content-Length": "4" },
+        });
+      }
+      return Response.json({ ok: true, result: { message_id: 42 } });
+    });
+    vi.stubGlobal("fetch", telegramFetch);
+
+    let agentRequestBody: unknown;
+    const agentFetch = vi.fn(async (request: Request) => {
+      agentRequestBody = await request.json();
+      return new Response(sseStream([["done", { content: "Image result" }]]), {
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    });
+
+    await handleTelegramWebhook(
+      webhookRequest({
+        message: {
+          message_id: 20,
+          caption: "what is this",
+          photo: [{ file_id: "photo-1", file_size: 4, width: 32, height: 32 }],
+          chat: { id: 123, type: "private" },
+        },
+      }),
+      env({
+        TELEGRAM_SECRET_TOKEN: "secret",
+        TELEGRAM_BOT_TOKEN: "bot-token",
+        TELEGRAM_ALLOWED_CHAT_IDS: "123",
+        IMAGE_MODEL_KEY: "key",
+        AGENT_OBJECT: agentNamespace(agentFetch, {
+          ok: true,
+          settings: {
+            activeProfileId: "vision",
+            profiles: [
+              {
+                id: "vision",
+                baseUrl: "https://api.openai.com/v1",
+                model: "gpt-vision-test",
+                apiKeyEnv: "IMAGE_MODEL_KEY",
+                modalities: ["text", "image"],
+              },
+            ],
+          },
+        }),
+      } as Partial<Env>),
+    );
+
+    expect(agentRequestBody).toMatchObject({
+      message: expect.stringContaining("User instruction: what is this"),
+      attachments: [
+        {
+          type: "image",
+          mediaType: "image/jpeg",
+          filename: "telegram-photo.jpg",
+        },
+      ],
+      llm: {
+        baseUrl: "https://api.openai.com/v1",
+        apiKey: "key",
+        model: "gpt-vision-test",
+        modalities: ["text", "image"],
+      },
+      source: { channel: "telegram", chatId: "123" },
+    });
+    expect((agentRequestBody as { attachments: Array<{ data: string }> }).attachments[0]?.data)
+      .toMatch(/^data:image\/jpeg;base64,/);
+  });
+
   it("falls back to edit-message streaming when Telegram drafts fail", async () => {
     const telegramFetch = vi.fn(async (url: string) => {
       if (url.endsWith("/sendMessageDraft")) {

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Env, LlmConfig } from "../types";
+import type { Env, LlmConfig, LlmModality } from "../types";
 
 export const LLM_SETTINGS_KEY = "llm";
 export const DEFAULT_LLM_API_KEY_ENV = "LLM_API_KEY";
@@ -7,6 +7,7 @@ export const LLM_PROFILES_JSON_ENV = "LLM_PROFILES_JSON";
 
 const MAX_LLM_PROFILES = 10;
 const MAX_EXTRA_HEADERS = 10;
+const DEFAULT_MODALITIES: LlmModality[] = ["text"];
 const SECRET_HEADER_NAMES = new Set([
   "authorization",
   "proxy-authorization",
@@ -17,6 +18,7 @@ const SECRET_HEADER_NAMES = new Set([
 const profileId = z.string().trim().min(1).max(40).regex(/^[a-zA-Z0-9_-]+$/);
 const envBindingName = z.string().trim().min(1).max(64).regex(/^[A-Z][A-Z0-9_]*$/);
 const nonEmptyString = z.string().trim().min(1);
+const LlmModalitySchema = z.enum(["text", "image", "audio", "pdf"]);
 const aiGatewayPathPart = z
   .string()
   .trim()
@@ -52,6 +54,7 @@ export const LlmProfileSchema = z
     apiKeyEnv: envBindingName.optional().default(DEFAULT_LLM_API_KEY_ENV),
     temperature: z.number().min(0).max(2).optional(),
     maxTokens: z.number().int().positive().max(128_000).optional(),
+    modalities: z.array(LlmModalitySchema).optional().default(DEFAULT_MODALITIES),
     extraHeaders: ExtraHeadersSchema
       .optional()
       .transform((headers) =>
@@ -142,6 +145,7 @@ export function createEnvLlmSettings(env: Env): LlmSettings | null {
         apiKeyEnv: DEFAULT_LLM_API_KEY_ENV,
         temperature: parseOptionalNumber(readEnvString(env, "LLM_TEMPERATURE")),
         maxTokens: parseOptionalNumber(readEnvString(env, "LLM_MAX_TOKENS")),
+        modalities: parseOptionalModalities(readEnvString(env, "LLM_MODALITIES")) ?? DEFAULT_MODALITIES,
         extraHeaders: undefined,
       },
     ],
@@ -169,6 +173,7 @@ export function resolveLlmConfigFromSettings(settings: LlmSettings, env: Env): L
     temperature: profile.temperature,
     maxTokens: profile.maxTokens,
     extraHeaders: profile.extraHeaders,
+    modalities: profile.modalities,
   };
 }
 
@@ -178,6 +183,7 @@ export function summarizeLlmSettings(settings: LlmSettings, env: Env) {
     profiles: settings.profiles.map((profile) => ({
       ...profile,
       baseUrl: resolveLlmProfileBaseUrl(profile),
+      modalities: profile.modalities,
       hasApiKey: Boolean(readEnvString(env, profile.apiKeyEnv)),
     })),
   };
@@ -208,6 +214,19 @@ function parseOptionalNumber(value: string | undefined) {
   if (!value) return undefined;
   const number = Number(value);
   return Number.isFinite(number) ? number : undefined;
+}
+
+function parseOptionalModalities(value: string | undefined): LlmModality[] | undefined {
+  if (!value) return undefined;
+  const modalities = value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(isLlmModality);
+  return modalities.length > 0 ? [...new Set(modalities)] : undefined;
+}
+
+function isLlmModality(value: string): value is LlmModality {
+  return value === "text" || value === "image" || value === "audio" || value === "pdf";
 }
 
 function formatZodError(prefix: string, error: z.ZodError) {

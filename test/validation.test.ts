@@ -48,6 +48,18 @@ describe("validation", () => {
     expect(update.message?.chat.id).toBe("-100123");
   });
 
+  it("parses Telegram multimodal update fields", () => {
+    const update = TelegramUpdateSchema.parse({
+      message: {
+        message_id: 2,
+        photo: [{ file_id: "photo-1", file_size: 100, width: 10, height: 10 }],
+        chat: { id: 123, type: "private" },
+      },
+    });
+
+    expect(update.message?.photo?.[0]?.file_id).toBe("photo-1");
+  });
+
   it("parses Telegram LLM env", () => {
     expect(
       parseTelegramLlmEnv({
@@ -56,6 +68,7 @@ describe("validation", () => {
         LLM_MODEL: "gpt-test",
         LLM_TEMPERATURE: "0.3",
         LLM_MAX_TOKENS: "200",
+        LLM_MODALITIES: "text,image,audio",
       }),
     ).toEqual({
       baseUrl: "https://api.openai.com/v1",
@@ -63,6 +76,7 @@ describe("validation", () => {
       model: "gpt-test",
       temperature: 0.3,
       maxTokens: 200,
+      modalities: ["text", "image", "audio"],
     });
     expect(parseTelegramLlmEnv({})).toBeInstanceOf(Error);
   });

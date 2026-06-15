@@ -1,12 +1,34 @@
 import { z } from "zod";
-import type { ChannelSource, ChatRequest, LlmConfig } from "./types";
+import type { ChannelSource, ChatRequest, LlmConfig, LlmModality } from "./types";
 
 const MAX_MESSAGE_CHARS = 16_000;
 const MAX_HISTORY_MESSAGES = 24;
 const MAX_EXTRA_HEADERS = 10;
 const MAX_TASK_TITLE_CHARS = 1_200;
+const MAX_CHAT_ATTACHMENTS = 4;
+const MAX_ATTACHMENT_DATA_CHARS = 8 * 1024 * 1024;
 
 const nonEmptyString = z.string().trim().min(1);
+const LlmModalitySchema = z.enum(["text", "image", "audio", "pdf"]);
+
+export const ChatContentPartSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("text"),
+    text: nonEmptyString.transform((text) => text.slice(0, MAX_MESSAGE_CHARS)),
+  }),
+  z.object({
+    type: z.literal("image"),
+    data: nonEmptyString.max(MAX_ATTACHMENT_DATA_CHARS),
+    mediaType: z.string().trim().min(1).max(120).optional(),
+    filename: z.string().trim().min(1).max(200).optional(),
+  }),
+  z.object({
+    type: z.literal("file"),
+    data: nonEmptyString.max(MAX_ATTACHMENT_DATA_CHARS),
+    mediaType: nonEmptyString.max(120),
+    filename: z.string().trim().min(1).max(200).optional(),
+  }),
+]);
 
 export const LlmConfigSchema = z.object({
   baseUrl: nonEmptyString,
@@ -20,6 +42,7 @@ export const LlmConfigSchema = z.object({
     .transform((headers) =>
       headers ? Object.fromEntries(Object.entries(headers).slice(0, MAX_EXTRA_HEADERS)) : undefined,
     ),
+  modalities: z.array(LlmModalitySchema).optional().transform(normalizeModalities),
 });
 
 export const ClientChatMessageSchema = z.object({
@@ -29,6 +52,9 @@ export const ClientChatMessageSchema = z.object({
 
 export const ChatRequestSchema = z.object({
   message: nonEmptyString.transform((message) => message.slice(0, MAX_MESSAGE_CHARS)),
+  attachments: z.array(ChatContentPartSchema).optional().default([]).transform((attachments) =>
+    attachments.slice(0, MAX_CHAT_ATTACHMENTS),
+  ),
   history: z
     .array(ClientChatMessageSchema)
     .optional()
@@ -85,12 +111,36 @@ const TelegramDocumentSchema = z
   .passthrough()
   .optional();
 
+const TelegramPhotoSizeSchema = z
+  .object({
+    file_id: z.string().min(1),
+    file_size: z.number().int().nonnegative().optional(),
+    width: z.number().int().nonnegative().optional(),
+    height: z.number().int().nonnegative().optional(),
+  })
+  .passthrough();
+
+const TelegramMediaFileSchema = z
+  .object({
+    file_id: z.string().min(1),
+    file_name: z.string().optional(),
+    mime_type: z.string().optional(),
+    file_size: z.number().int().nonnegative().optional(),
+    duration: z.number().int().nonnegative().optional(),
+  })
+  .passthrough()
+  .optional();
+
 const TelegramMessageSchema = z
   .object({
     message_id: z.number().int(),
     text: z.string().optional(),
     caption: z.string().optional(),
     document: TelegramDocumentSchema,
+    photo: z.array(TelegramPhotoSizeSchema).optional(),
+    audio: TelegramMediaFileSchema,
+    voice: TelegramMediaFileSchema,
+    video: TelegramMediaFileSchema,
     chat: z.object({
       id: z.union([z.number().int(), z.string()]).transform(String),
       type: z.string(),
@@ -120,6 +170,7 @@ export const TelegramLlmEnvSchema = z.object({
   LLM_MODEL: nonEmptyString,
   LLM_TEMPERATURE: z.string().optional().transform(parseOptionalEnvNumber),
   LLM_MAX_TOKENS: z.string().optional().transform(parseOptionalEnvNumber),
+  LLM_MODALITIES: z.string().optional().transform(parseOptionalEnvModalities),
 });
 
 export function parseChatRequestPayload(payload: unknown): ChatRequest {
@@ -189,6 +240,7 @@ export function parseServerLlmEnv(env: unknown, label = "Channel"): LlmConfig | 
     model: result.data.LLM_MODEL,
     temperature: result.data.LLM_TEMPERATURE,
     maxTokens: result.data.LLM_MAX_TOKENS,
+    ...(result.data.LLM_MODALITIES ? { modalities: result.data.LLM_MODALITIES } : {}),
   };
 }
 
@@ -196,6 +248,25 @@ function parseOptionalEnvNumber(value: string | undefined) {
   if (!value) return undefined;
   const number = Number(value);
   return Number.isFinite(number) ? number : undefined;
+}
+
+function parseOptionalEnvModalities(value: string | undefined): LlmModality[] | undefined {
+  if (!value) return undefined;
+  return normalizeModalities(
+    value
+      .split(",")
+      .map((item) => item.trim())
+      .filter(isLlmModality),
+  );
+}
+
+function normalizeModalities(value: LlmModality[] | undefined) {
+  if (!value?.length) return undefined;
+  return [...new Set(value)];
+}
+
+function isLlmModality(value: string): value is LlmModality {
+  return value === "text" || value === "image" || value === "audio" || value === "pdf";
 }
 
 function formatZodError(prefix: string, error: z.ZodError) {

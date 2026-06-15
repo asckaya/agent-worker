@@ -121,6 +121,56 @@ describe("streamChatCompletion", () => {
     ]);
   });
 
+  it("serializes multimodal image parts for OpenAI-compatible providers", async () => {
+    let requestBody: unknown;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        requestBody = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(
+          sseStream([
+            { choices: [{ delta: { content: "ok" } }] },
+            "[DONE]",
+          ]),
+          { status: 200 },
+        );
+      }),
+    );
+
+    await streamChatCompletion({
+      config: llmConfig(),
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "describe" },
+            {
+              type: "image",
+              data: "data:image/png;base64,iVBORw0KGgo=",
+              mediaType: "image/png",
+            },
+          ],
+        },
+      ],
+      onToken: () => undefined,
+    });
+
+    expect(requestBody).toMatchObject({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "describe" },
+            {
+              type: "image_url",
+              image_url: { url: "data:image/png;base64,iVBORw0KGgo=" },
+            },
+          ],
+        },
+      ],
+    });
+  });
+
   it("throws on non-OK provider responses", async () => {
     vi.stubGlobal(
       "fetch",

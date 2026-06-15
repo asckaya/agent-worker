@@ -640,7 +640,7 @@ export class UserAgentObject {
     const modelMessages = buildModelMessages(
       [
         ...buildClientHistoryMessages(payload.history ?? []),
-        { role: "user", content: payload.message },
+        { role: "user", content: buildUserContent(payload.message, payload.attachments) },
       ],
       relevantMemories,
     );
@@ -2021,6 +2021,14 @@ function appendEphemeralUser(history: ChatRequest["history"], user: string) {
     ...(history ?? []),
     { role: "user" as const, content: user },
   ].slice(-MAX_EPHEMERAL_HISTORY_MESSAGES);
+}
+
+function buildUserContent(message: string, attachments: ChatRequest["attachments"]) {
+  if (!attachments?.length) return message;
+  return [
+    { type: "text" as const, text: message },
+    ...attachments,
+  ];
 }
 
 function formatFollowUpStreamBoundary(message: string) {

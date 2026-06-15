@@ -21,6 +21,26 @@ export interface Env {
 
 export type ChatRole = "system" | "user" | "assistant" | "tool";
 
+export type LlmModality = "text" | "image" | "audio" | "pdf";
+
+export type ChatContentPart =
+  | {
+      type: "text";
+      text: string;
+    }
+  | {
+      type: "image";
+      data: string;
+      mediaType?: string;
+      filename?: string;
+    }
+  | {
+      type: "file";
+      data: string;
+      mediaType: string;
+      filename?: string;
+    };
+
 export interface ToolCall {
   id: string;
   type: "function";
@@ -32,7 +52,7 @@ export interface ToolCall {
 
 export interface ChatMessage {
   role: ChatRole;
-  content: string | null;
+  content: string | ChatContentPart[] | null;
   name?: string;
   tool_call_id?: string;
   tool_calls?: ToolCall[];
@@ -50,11 +70,13 @@ export interface LlmConfig {
   temperature?: number;
   maxTokens?: number;
   extraHeaders?: Record<string, string>;
+  modalities?: LlmModality[];
 }
 
 export interface ChatRequest {
   message: string;
   history?: ClientChatMessage[];
+  attachments?: ChatContentPart[];
   llm: LlmConfig;
   source?: ChannelSource;
 }

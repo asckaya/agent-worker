@@ -1,7 +1,7 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { jsonSchema, streamText } from "ai";
-import type { JSONSchema7, ModelMessage, ToolSet } from "ai";
-import type { ChatMessage } from "../types";
+import type { FilePart, ImagePart, JSONSchema7, ModelMessage, TextPart, ToolSet } from "ai";
+import type { ChatContentPart, ChatMessage } from "../types";
 import type { ModelTool } from "../tools/registry";
 import type { ModelClient, ModelStreamOptions, ModelStreamResult } from "./types";
 
@@ -99,7 +99,7 @@ function toModelMessages(messages: ChatMessage[]): ModelMessage[] {
             type: "tool-result",
             toolCallId: message.tool_call_id ?? crypto.randomUUID(),
             toolName: message.name ?? "unknown_tool",
-            output: toToolResultOutput(message.content),
+            output: toToolResultOutput(contentToText(message.content)),
           },
         ],
       };
@@ -109,7 +109,7 @@ function toModelMessages(messages: ChatMessage[]): ModelMessage[] {
       return {
         role: "assistant",
         content: [
-          ...(message.content
+          ...(typeof message.content === "string" && message.content
             ? [
                 {
                   type: "text" as const,
@@ -127,11 +127,50 @@ function toModelMessages(messages: ChatMessage[]): ModelMessage[] {
       };
     }
 
+    if (message.role === "user" && Array.isArray(message.content)) {
+      return {
+        role: "user",
+        content: message.content.map(toModelContentPart),
+      };
+    }
+
     return {
       role: message.role,
-      content: message.content ?? "",
+      content: contentToText(message.content),
     } as ModelMessage;
   });
+}
+
+function toModelContentPart(part: ChatContentPart): TextPart | ImagePart | FilePart {
+  if (part.type === "text") {
+    return {
+      type: "text",
+      text: part.text,
+    };
+  }
+
+  if (part.type === "image") {
+    return {
+      type: "image",
+      image: part.data,
+      mediaType: part.mediaType,
+    };
+  }
+
+  return {
+    type: "file",
+    data: part.data,
+    mediaType: part.mediaType,
+    filename: part.filename,
+  };
+}
+
+function contentToText(content: ChatMessage["content"]) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => (part.type === "text" ? part.text : `[${part.type}: ${part.filename ?? part.mediaType ?? "attachment"}]`))
+    .join("\n");
 }
 
 function parseToolCallArguments(value: string) {
