@@ -3,13 +3,24 @@ import { DEFAULT_SYSTEM_PROMPT } from "./prompts";
 
 const MAX_MEMORY_ITEMS_IN_CONTEXT = 8;
 
-export function buildModelMessages(history: ChatMessage[], memories: string[]): ChatMessage[] {
+export function buildModelMessages(
+  history: ChatMessage[],
+  memories: string[],
+  options: { skillGuidance?: string } = {},
+): ChatMessage[] {
   const messages: ChatMessage[] = [
     {
       role: "system",
       content: DEFAULT_SYSTEM_PROMPT,
     },
   ];
+
+  if (options.skillGuidance) {
+    messages.push({
+      role: "system",
+      content: options.skillGuidance,
+    });
+  }
 
   const memoryContext = memories
     .slice(0, MAX_MEMORY_ITEMS_IN_CONTEXT)

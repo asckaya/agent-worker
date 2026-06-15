@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { SkillDefinition } from "../skills/settings";
 import type { Env } from "../types";
 
 export type ToolRisk = "read" | "write" | "external" | "dangerous";
@@ -18,6 +19,20 @@ export interface ToolContext {
   env?: Env;
   saveMemory: (content: string) => Promise<void>;
   searchMemory: (query: string) => Promise<string[]>;
+  skills?: {
+    list: () => Promise<SkillDefinition[]>;
+    upsert: (skill: unknown) => Promise<void>;
+    delete: (name: string) => Promise<boolean>;
+  };
+  mcp?: {
+    upsertPublicServer: (server: {
+      name: string;
+      url: string;
+      disabled?: boolean;
+      timeoutMs?: number;
+    }) => Promise<void>;
+    deleteServer: (name: string) => Promise<boolean>;
+  };
 }
 
 export interface ToolDefinition<Input = unknown, Output = unknown> {
@@ -26,6 +41,7 @@ export interface ToolDefinition<Input = unknown, Output = unknown> {
   inputSchema: z.ZodType<Input>;
   risk: ToolRisk;
   requiresApproval: boolean;
+  modelParameters?: Record<string, unknown>;
   toolset?: string;
   requiresEnv?: string[];
   maxResultChars?: number;
@@ -72,7 +88,7 @@ export class ToolRegistry {
         description: tool.requiresApproval
           ? `${tool.description} Requires explicit user approval before execution.`
           : tool.description,
-        parameters: z.toJSONSchema(tool.inputSchema) as Record<string, unknown>,
+        parameters: tool.modelParameters ?? (z.toJSONSchema(tool.inputSchema) as Record<string, unknown>),
       },
     }));
   }

@@ -7,6 +7,13 @@ import {
   DurableObjectMemoryProvider,
 } from "../memory/provider";
 import {
+  MCP_SETTINGS_KEY,
+  mcpServerSummary,
+  parseMcpSettingsPayload,
+  type McpSettings,
+} from "../mcp/settings";
+import { createMcpToolDefinitions } from "../mcp/tools";
+import {
   createEnvLlmSettings,
   getActiveLlmProfile,
   LLM_SETTINGS_KEY,
@@ -17,6 +24,17 @@ import {
   type LlmSettings,
 } from "../llm/settings";
 import { streamChatCompletion } from "../model/openai-compatible";
+import {
+  dedupeSkills,
+  parseSkillDefinitionPayload,
+  parseSkillMarkdownPayload,
+  parseSkillSettingsPayload,
+  SKILL_SETTINGS_KEY,
+  skillGuidance,
+  type SkillDefinition,
+  type SkillSettings,
+} from "../skills/settings";
+import { importSkillsFromSource } from "../skills/source";
 import { createDefaultToolRegistry } from "../tools";
 import { DEFAULT_TOOL_TIMEOUT_MS, ToolExecutor } from "../tools/executor";
 import {
@@ -25,7 +43,7 @@ import {
   type ToolRecoveryResult,
   ToolRunGuardrails,
 } from "../tools/guardrails";
-import type { ToolContext, ToolDefinition } from "../tools/registry";
+import { ToolRegistry, type ToolContext, type ToolDefinition } from "../tools/registry";
 import type {
   ActiveAgentRun,
   ChannelSource,
@@ -189,6 +207,8 @@ export class UserAgentObject {
         pendingApprovals: this.getPendingApprovals(),
         activeRuns: this.getActiveRuns(),
         llm: this.getLlmSettingsSummary(),
+        skills: this.getSkillSettingsSummary(),
+        mcp: this.getMcpSettingsSummary(),
         limits: {
           maxMemoryItems: MAX_MEMORY_ITEMS,
           maxMemoryChars: MAX_MEMORY_CHARS,
@@ -262,6 +282,48 @@ export class UserAgentObject {
 
     if (request.method === "POST" && url.pathname === "/settings/llm/test") {
       return this.handleTestLlmSettings();
+    }
+
+    if (request.method === "GET" && url.pathname === "/settings/skills") {
+      return Response.json({ ok: true, settings: this.getSkillSettings() });
+    }
+
+    if (request.method === "PUT" && url.pathname === "/settings/skills") {
+      return this.handleUpdateSkillSettings(request);
+    }
+
+    if (request.method === "POST" && url.pathname === "/settings/skills/import") {
+      return this.handleImportSkillMarkdown(request);
+    }
+
+    if (request.method === "POST" && url.pathname === "/settings/skills/source") {
+      return this.handleImportSkillSource(request);
+    }
+
+    if (request.method === "DELETE" && url.pathname === "/settings/skills") {
+      this.deleteRuntimeSetting(SKILL_SETTINGS_KEY);
+      return Response.json({ ok: true, settings: this.getSkillSettings() });
+    }
+
+    if (request.method === "GET" && url.pathname === "/settings/mcp") {
+      return Response.json({
+        ok: true,
+        settings: this.getMcpSettings(),
+        summary: this.getMcpSettingsSummary(),
+      });
+    }
+
+    if (request.method === "PUT" && url.pathname === "/settings/mcp") {
+      return this.handleUpdateMcpSettings(request);
+    }
+
+    if (request.method === "DELETE" && url.pathname === "/settings/mcp") {
+      this.deleteRuntimeSetting(MCP_SETTINGS_KEY);
+      return Response.json({
+        ok: true,
+        settings: this.getMcpSettings(),
+        summary: this.getMcpSettingsSummary(),
+      });
     }
 
     if (request.method === "DELETE" && url.pathname.startsWith("/memories/")) {
@@ -482,6 +544,63 @@ export class UserAgentObject {
       const settings = parseLlmSettingsPayload(await request.json().catch(() => ({})));
       this.saveRuntimeSetting(LLM_SETTINGS_KEY, settings);
       return Response.json({ ok: true, ...this.getLlmSettingsResponse() });
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  private async handleUpdateSkillSettings(request: Request) {
+    try {
+      const settings = parseSkillSettingsPayload(await request.json().catch(() => ({})));
+      this.saveRuntimeSetting(SKILL_SETTINGS_KEY, settings);
+      return Response.json({ ok: true, settings: this.getSkillSettings() });
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  private async handleImportSkillMarkdown(request: Request) {
+    try {
+      const skill = parseSkillMarkdownPayload(await request.json().catch(() => ({})));
+      this.upsertSkill(skill);
+      return Response.json({
+        ok: true,
+        skill: this.getSkillSettings().skills.find((item) => item.name === skill.name),
+        settings: this.getSkillSettings(),
+      });
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  private async handleImportSkillSource(request: Request) {
+    try {
+      const skills = await importSkillsFromSource(await request.json().catch(() => ({})), {
+        fetchImpl: (input, init) => fetch(input, init),
+        token: this.env.GITHUB_TOKEN,
+      });
+      for (const skill of skills) {
+        this.upsertSkill(skill);
+      }
+      return Response.json({
+        ok: true,
+        imported: skills.map((skill) => skill.name),
+        settings: this.getSkillSettings(),
+      });
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  private async handleUpdateMcpSettings(request: Request) {
+    try {
+      const settings = parseMcpSettingsPayload(await request.json().catch(() => ({})));
+      this.saveRuntimeSetting(MCP_SETTINGS_KEY, settings);
+      return Response.json({
+        ok: true,
+        settings: this.getMcpSettings(),
+        summary: this.getMcpSettingsSummary(),
+      });
     } catch (error) {
       return errorResponse(error);
     }
@@ -774,12 +893,14 @@ export class UserAgentObject {
   ) {
     const runId = options.runId ?? crypto.randomUUID();
     const relevantMemories = await this.searchMemory(payload.message);
+    const configuredSkills = this.getSkillSettings().skills;
     const modelMessages = buildModelMessages(
       [
         ...buildClientHistoryMessages(payload.history ?? []),
         { role: "user", content: buildUserContent(payload.message, payload.attachments) },
       ],
       relevantMemories,
+      { skillGuidance: skillGuidance(configuredSkills) },
     );
 
     await callbacks.onMeta?.({
@@ -809,7 +930,7 @@ export class UserAgentObject {
     startStep?: number;
     consumePendingFollowUps?: () => ChatRequest[];
   }) {
-    const registry = createDefaultToolRegistry(this.env);
+    const registry = await this.createToolRegistry();
     const modelTools = registry.listModelTools();
     const toolGuardrails = new ToolRunGuardrails();
     const toolRecovery = new ToolLoopRecovery();
@@ -978,7 +1099,7 @@ export class UserAgentObject {
   }
 
   private preflightToolCall(
-    registry: ReturnType<typeof createDefaultToolRegistry>,
+    registry: ToolRegistry,
     availableToolNames: string[],
     toolCall: ToolCall,
     parsedArgs: unknown | Error,
@@ -1404,6 +1525,53 @@ export class UserAgentObject {
       : { source: "none" as const, activeProfileId: undefined, profiles: [] };
   }
 
+  private getSkillSettings(): SkillSettings {
+    const row = this.query<RuntimeSettingRow>(
+      "SELECT key, value_json, updated_at FROM runtime_settings WHERE key = ? LIMIT 1",
+      SKILL_SETTINGS_KEY,
+    )[0];
+    if (!row) return { skills: [] };
+
+    try {
+      return parseSkillSettingsPayload(JSON.parse(row.value_json));
+    } catch {
+      return { skills: [] };
+    }
+  }
+
+  private getSkillSettingsSummary() {
+    const settings = this.getSkillSettings();
+    return {
+      count: settings.skills.length,
+      skills: settings.skills.map((skill) => ({
+        name: skill.name,
+        description: skill.description,
+      })),
+    };
+  }
+
+  private getMcpSettings(): McpSettings {
+    const row = this.query<RuntimeSettingRow>(
+      "SELECT key, value_json, updated_at FROM runtime_settings WHERE key = ? LIMIT 1",
+      MCP_SETTINGS_KEY,
+    )[0];
+    if (!row) return { servers: {} };
+
+    try {
+      return parseMcpSettingsPayload(JSON.parse(row.value_json));
+    } catch {
+      return { servers: {} };
+    }
+  }
+
+  private getMcpSettingsSummary() {
+    const settings = this.getMcpSettings();
+    return {
+      serverCount: Object.keys(settings.servers).length,
+      servers: mcpServerSummary(settings),
+    };
+  }
+
   private getLlmSettingsResponse() {
     return {
       source: this.getEffectiveLlmSettings().source,
@@ -1429,6 +1597,17 @@ export class UserAgentObject {
 
   private deleteRuntimeSetting(key: string) {
     this.ctx.storage.sql.exec("DELETE FROM runtime_settings WHERE key = ?", key);
+  }
+
+  private async createToolRegistry() {
+    const registry = createDefaultToolRegistry(this.env);
+    const mcpTools = await createMcpToolDefinitions(this.getMcpSettings(), (input, init) =>
+      fetch(input, init),
+    );
+    for (const tool of mcpTools) {
+      registry.register(tool);
+    }
+    return registry;
   }
 
   private getActiveRun(source: ChannelSource | undefined) {
@@ -2010,7 +2189,7 @@ export class UserAgentObject {
     await callbacks.onMeta?.({ approval });
     throwIfAborted(activeRun.abortController.signal);
 
-    const registry = createDefaultToolRegistry(this.env);
+    const registry = await this.createToolRegistry();
     const toolExecutor = new ToolExecutor(registry, this.createToolContext(), {
       timeoutMs: DEFAULT_TOOL_TIMEOUT_MS,
     });
@@ -2361,7 +2540,49 @@ export class UserAgentObject {
         this.saveMemory(content);
       },
       searchMemory: async (query) => this.searchMemory(query),
+      skills: {
+        list: async () => this.getSkillSettings().skills,
+        upsert: async (skill) => {
+          this.upsertSkill(parseSkillDefinitionPayload(skill));
+        },
+        delete: async (name) => this.deleteSkill(name),
+      },
+      mcp: {
+        upsertPublicServer: async (server) => {
+          const current = this.getMcpSettings();
+          current.servers[server.name] = {
+            type: "remote",
+            url: server.url,
+            headers: undefined,
+            disabled: server.disabled ?? false,
+            timeoutMs: server.timeoutMs,
+          };
+          this.saveRuntimeSetting(MCP_SETTINGS_KEY, current);
+        },
+        deleteServer: async (name) => {
+          const current = this.getMcpSettings();
+          const existed = current.servers[name] !== undefined;
+          delete current.servers[name];
+          this.saveRuntimeSetting(MCP_SETTINGS_KEY, current);
+          return existed;
+        },
+      },
     };
+  }
+
+  private upsertSkill(skill: SkillDefinition) {
+    const current = this.getSkillSettings();
+    const next = dedupeSkills({
+      skills: [...current.skills.filter((item) => item.name !== skill.name), skill],
+    });
+    this.saveRuntimeSetting(SKILL_SETTINGS_KEY, next);
+  }
+
+  private deleteSkill(name: string) {
+    const current = this.getSkillSettings();
+    const next = current.skills.filter((skill) => skill.name !== name);
+    this.saveRuntimeSetting(SKILL_SETTINGS_KEY, { skills: next });
+    return next.length !== current.skills.length;
   }
 
   private async searchMemory(query: string) {

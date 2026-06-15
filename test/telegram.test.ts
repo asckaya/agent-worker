@@ -250,6 +250,80 @@ describe("telegram integration", () => {
     );
   });
 
+  it("streams bounded tool progress to a Telegram status message", async () => {
+    const telegramFetch = vi.fn(async () =>
+      Response.json({ ok: true, result: { message_id: 42 } }),
+    );
+    vi.stubGlobal("fetch", telegramFetch);
+
+    const agentFetch = vi.fn(async () =>
+      new Response(
+        sseStream([
+          ["message_delta", { delta: "I will check the page first." }],
+          ["tool_call", { id: "tc_1", name: "fetch_url" }],
+          ["tool_result", { id: "tc_1", name: "fetch_url", result: { ok: true } }],
+          ["done", { content: "The page is reachable." }],
+        ]),
+        {
+          headers: { "Content-Type": "text/event-stream" },
+        },
+      ),
+    );
+
+    await handleTelegramWebhook(
+      webhookRequest({
+        message: {
+          message_id: 9,
+          text: "check page",
+          chat: { id: 123, type: "private" },
+        },
+      }),
+      env({
+        TELEGRAM_SECRET_TOKEN: "secret",
+        TELEGRAM_BOT_TOKEN: "bot-token",
+        TELEGRAM_ALLOWED_CHAT_IDS: "123",
+        LLM_BASE_URL: "https://api.openai.com/v1",
+        LLM_API_KEY: "key",
+        LLM_MODEL: "gpt-test",
+        AGENT_OBJECT: agentNamespace(agentFetch),
+      }),
+    );
+
+    expect(telegramFetch).toHaveBeenCalledWith(
+      "https://api.telegram.org/botbot-token/sendMessage",
+      expect.objectContaining({
+        body: JSON.stringify({
+          chat_id: "123",
+          text: "Progress\n- Assistant: I will check the page first.\n- Running fetch_url",
+          reply_to_message_id: 9,
+          allow_sending_without_reply: true,
+        }),
+      }),
+    );
+    expect(telegramFetch).toHaveBeenCalledWith(
+      "https://api.telegram.org/botbot-token/editMessageText",
+      expect.objectContaining({
+        body: JSON.stringify({
+          chat_id: "123",
+          message_id: 42,
+          text: "Progress\n- Ran 1 tool: fetch_url\n- Status: ok",
+        }),
+      }),
+    );
+    expect(telegramFetch).toHaveBeenCalledWith(
+      "https://api.telegram.org/botbot-token/sendMessage",
+      expect.objectContaining({
+        body: JSON.stringify({
+          chat_id: "123",
+          text: "The page is reachable.",
+          reply_to_message_id: 9,
+          allow_sending_without_reply: true,
+          parse_mode: "MarkdownV2",
+        }),
+      }),
+    );
+  });
+
   it("batches rapid Telegram text updates before calling the agent", async () => {
     vi.useFakeTimers();
     const telegramFetch = vi.fn(async () =>

@@ -1,5 +1,12 @@
 import { arxivSearchTool } from "./arxiv";
 import { calculateTool, currentTimeTool } from "./basic";
+import {
+  deleteMcpServerTool,
+  deleteSkillTool,
+  skillTool,
+  upsertMcpServerTool,
+  upsertSkillTool,
+} from "./config";
 import { fetchUrlTool } from "./fetch-url";
 import {
   githubGetRepositoryTool,
@@ -23,5 +30,10 @@ export function createDefaultToolRegistry(env?: Env) {
   registry.register(httpRequestTool);
   registry.register(saveMemoryTool);
   registry.register(searchMemoryTool);
+  registry.register(skillTool);
+  registry.register(upsertSkillTool);
+  registry.register(deleteSkillTool);
+  registry.register(upsertMcpServerTool);
+  registry.register(deleteMcpServerTool);
   return registry;
 }

@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "latest",
+    "@modelcontextprotocol/sdk": "latest",
     "@octokit/request": "latest",
     "@vitejs/plugin-react": "latest",
     "ai": "latest",
@@ -24,7 +25,9 @@
     "hono": "latest",
     "react": "latest",
     "react-dom": "latest",
+    "skills": "latest",
     "vite": "latest",
+    "yaml": "latest",
     "zod": "latest"
   },
   "devDependencies": {

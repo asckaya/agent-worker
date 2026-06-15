@@ -347,6 +347,140 @@ describe("UserAgentObject run state", () => {
     });
   });
 
+  it("imports standard SKILL.md and exposes available skill guidance", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql);
+    const markdown = [
+      "---",
+      "name: planning",
+      "description: Use when turning goals into concrete next steps",
+      "---",
+      "# Planning",
+      "",
+      "Break the work into sequenced steps.",
+    ].join("\n");
+
+    const imported = await object.fetch(
+      jsonRequest("/settings/skills/import", { markdown }),
+    );
+    expect(imported.status).toBe(200);
+    await expect(imported.json()).resolves.toMatchObject({
+      ok: true,
+      skill: {
+        name: "planning",
+        description: "Use when turning goals into concrete next steps",
+      },
+    });
+
+    const capturedRequests: unknown[] = [];
+    vi.stubGlobal("fetch", createCapturingFetchMock([openAiTextResponse("ok")], capturedRequests));
+    await readEvents(await object.fetch(chatRequest("make a plan")));
+
+    expect(JSON.stringify(requestMessages(capturedRequests[0]))).toContain("<available_skills>");
+    expect(JSON.stringify(requestMessages(capturedRequests[0]))).toContain("<name>planning</name>");
+  });
+
+  it("imports skills source resources and returns them from the skill tool", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql);
+    const skillMarkdown = [
+      "---",
+      "name: release-notes",
+      "description: Draft release notes from structured changes",
+      "---",
+      "# Release Notes",
+      "",
+      "Use the helper script when changes need grouping.",
+    ].join("\n");
+
+    vi.stubGlobal("fetch", createGitHubSkillSourceFetchMock({
+      "skills/release-notes/SKILL.md": skillMarkdown,
+      "skills/release-notes/scripts/group-changes.py": "print('group changes')",
+      "skills/release-notes/templates/notes.md": "## Added\n\n## Fixed\n",
+    }));
+
+    const imported = await object.fetch(
+      jsonRequest("/settings/skills/source", {
+        source: "vercel-labs/agent-skills/skills/release-notes",
+      }),
+    );
+
+    expect(imported.status).toBe(200);
+    await expect(imported.json()).resolves.toMatchObject({
+      ok: true,
+      imported: ["release-notes"],
+      settings: {
+        skills: [
+          {
+            name: "release-notes",
+            files: [
+              { path: "scripts/group-changes.py", content: "print('group changes')" },
+              { path: "templates/notes.md", content: "## Added\n\n## Fixed\n" },
+            ],
+          },
+        ],
+      },
+    });
+
+    vi.stubGlobal(
+      "fetch",
+      createFetchMock([
+        openAiToolCallResponse("skill", { name: "release-notes" }),
+        openAiTextResponse("Loaded."),
+      ]),
+    );
+    const events = await readEvents(await object.fetch(chatRequest("load release skill")));
+    const toolResult = events.find((event) => event.event === "tool_result");
+    expect(toolResult).toBeDefined();
+    const resultText = JSON.stringify(
+      (toolResult as Extract<AgentStreamEvent, { event: "tool_result" }>).data.result,
+    );
+    expect(resultText).toContain("<skill_files>");
+    expect(resultText).toContain("scripts/group-changes.py");
+    expect(resultText).toContain("print('group changes')");
+  });
+
+  it("stores MCP settings and summarizes header names without values", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql);
+
+    const update = await object.fetch(
+      jsonRequest(
+        "/settings/mcp",
+        {
+          servers: {
+            search: {
+              type: "remote",
+              url: "https://mcp.example.com/mcp",
+              headers: {
+                Authorization: "Bearer secret-token",
+              },
+            },
+          },
+        },
+        "PUT",
+      ),
+    );
+
+    expect(update.status).toBe(200);
+    await expect(update.json()).resolves.toMatchObject({
+      ok: true,
+      summary: {
+        servers: [
+          {
+            name: "search",
+            headerNames: ["Authorization"],
+          },
+        ],
+      },
+    });
+
+    const state = await object.fetch(new Request("https://agent.test/state"));
+    const stateText = JSON.stringify(await state.json());
+    expect(stateText).toContain("Authorization");
+    expect(stateText).not.toContain("secret-token");
+  });
+
   it("stores tasks and reschedules reminder alarms", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-06-15T10:00:00Z"));
@@ -627,6 +761,35 @@ function createCapturingFetchMock(llmResponses: MockLlmResponse[], capturedReque
     if (url === "https://example.com/") {
       return new Response("Example page body", {
         headers: { "Content-Type": "text/plain" },
+      });
+    }
+
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+}
+
+function createGitHubSkillSourceFetchMock(files: Record<string, string>) {
+  const entries = Object.keys(files).map((path, index) => ({
+    path,
+    type: "blob",
+    sha: `sha-${index}`,
+    size: files[path].length,
+  }));
+  const contentBySha = new Map(entries.map((entry) => [entry.sha, files[entry.path]]));
+
+  return vi.fn(async (input: RequestInfo | URL) => {
+    const url = input instanceof Request ? input.url : String(input);
+    if (url === "https://api.github.com/repos/vercel-labs/agent-skills/git/trees/HEAD?recursive=1") {
+      return Response.json({ tree: entries });
+    }
+
+    const blobMatch = /^https:\/\/api\.github\.com\/repos\/vercel-labs\/agent-skills\/git\/blobs\/(.+)$/.exec(url);
+    if (blobMatch) {
+      const content = contentBySha.get(decodeURIComponent(blobMatch[1]));
+      if (content === undefined) return new Response("Not found", { status: 404 });
+      return Response.json({
+        encoding: "base64",
+        content: btoa(content),
       });
     }
 

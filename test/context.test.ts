@@ -28,6 +28,20 @@ describe("agent context", () => {
     expect(messages.at(-1)).toEqual({ role: "user", content: "What should I remember?" });
   });
 
+  it("injects available skill guidance when provided", () => {
+    const messages = buildModelMessages(
+      [{ role: "user", content: "Plan this" }],
+      [],
+      { skillGuidance: "<available_skills><skill><name>planning</name></skill></available_skills>" },
+    );
+
+    expect(messages[1]).toEqual({
+      role: "system",
+      content: "<available_skills><skill><name>planning</name></skill></available_skills>",
+    });
+    expect(messages.at(-1)).toEqual({ role: "user", content: "Plan this" });
+  });
+
   it("does not trim chat history before sending model context", () => {
     const history = Array.from({ length: 30 }, (_, index) => ({
       role: index % 2 === 0 ? "user" as const : "assistant" as const,

@@ -26,6 +26,9 @@ const TELEGRAM_DRAFT_MIN_CHARS = 40;
 const TELEGRAM_TYPING_INTERVAL_MS = 4_000;
 const TELEGRAM_STREAM_CURSOR = " ▌";
 const TELEGRAM_FRESH_FINAL_AFTER_MS = 60_000;
+const TELEGRAM_STATUS_EDIT_INTERVAL_MS = 1_200;
+const TELEGRAM_STATUS_MAX_LINES = 6;
+const TELEGRAM_STATUS_PREVIEW_CHARS = 220;
 const TELEGRAM_APPROVAL_CALLBACK_PREFIX = "agent-worker";
 const TELEGRAM_TEXT_BATCH_DEFAULT_MS = 180;
 const TELEGRAM_TEXT_BATCH_MAX_MS = 1_000;
@@ -1387,6 +1390,7 @@ async function streamAgentEndpointToTelegram(
 ) {
   const typing = startTelegramTypingLoop(env, incoming.chatId);
   const stream = await TelegramStreamingResponder.create(env, incoming, placeholderText);
+  const statusStream = new TelegramRunStatusStream(env, incoming);
 
   try {
     const response = await fetchAgentObject(env, requestUrl, pathname, {
@@ -1403,7 +1407,7 @@ async function streamAgentEndpointToTelegram(
     let doneContent: string | undefined;
     let finishOptions: TelegramFinishOptions = {};
     for await (const event of readServerSentEvents(response)) {
-      const next = await applyAgentStreamEventToTelegram(stream, event, doneContent);
+      const next = await applyAgentStreamEventToTelegram(stream, statusStream, event, doneContent);
       doneContent = next.doneContent;
       finishOptions = {
         ...finishOptions,
@@ -1411,6 +1415,7 @@ async function streamAgentEndpointToTelegram(
       };
     }
 
+    await statusStream.finish();
     await stream.finish(doneContent, withFinalTelegramFormatting(finishOptions));
   } finally {
     typing.stop();
@@ -1419,14 +1424,23 @@ async function streamAgentEndpointToTelegram(
 
 async function applyAgentStreamEventToTelegram(
   stream: TelegramStreamingResponder,
+  statusStream: TelegramRunStatusStream,
   event: AgentStreamEvent,
   doneContent: string | undefined,
 ): Promise<{ doneContent: string | undefined; finishOptions?: TelegramFinishOptions }> {
   switch (event.event) {
     case "message_delta":
+      statusStream.recordAssistantDelta(event.data.delta);
       await stream.append(event.data.delta);
       return { doneContent };
+    case "tool_call":
+      await statusStream.recordToolCall(event.data);
+      return { doneContent };
+    case "tool_result":
+      await statusStream.recordToolResult(event.data);
+      return { doneContent };
     case "approval_required":
+      await statusStream.recordApprovalRequired(event.data);
       await stream.appendParagraph(event.data.message ?? "");
       return {
         doneContent,
@@ -1435,6 +1449,9 @@ async function applyAgentStreamEventToTelegram(
     case "message_stop":
       return { doneContent: event.data.content ?? doneContent };
     case "done":
+      if (typeof event.data.content === "string") {
+        statusStream.recordFinalAssistantContent(event.data.content);
+      }
       return {
         doneContent: typeof event.data.content === "string" ? event.data.content : doneContent,
       };
@@ -1442,6 +1459,127 @@ async function applyAgentStreamEventToTelegram(
       throw new Error(event.data.message);
     default:
       return { doneContent };
+  }
+}
+
+class TelegramRunStatusStream {
+  private messageId: number | undefined;
+  private lastText = "";
+  private lastEditAt = 0;
+  private assistantBuffer = "";
+  private assistantPreviewSent = false;
+  private toolCount = 0;
+  private errorCount = 0;
+  private readonly lines: string[] = [];
+  private readonly toolNames = new Set<string>();
+
+  constructor(
+    private readonly env: Env,
+    private readonly incoming: IncomingTelegramText,
+  ) {}
+
+  recordAssistantDelta(delta: string) {
+    if (!delta || this.assistantPreviewSent) return;
+    this.assistantBuffer = (this.assistantBuffer + delta).slice(0, TELEGRAM_STATUS_PREVIEW_CHARS * 2);
+  }
+
+  recordFinalAssistantContent(content: string) {
+    if (this.assistantPreviewSent || this.assistantBuffer.trim()) return;
+    this.assistantBuffer = content.slice(0, TELEGRAM_STATUS_PREVIEW_CHARS * 2);
+  }
+
+  async recordToolCall(data: Record<string, unknown>) {
+    this.flushAssistantPreviewLine();
+    const name = readStringField(data, "name") ?? "tool";
+    this.toolNames.add(name);
+    this.toolCount += 1;
+    const warning = readStringField(data, "warning");
+    this.pushLine(warning ? `Running ${name} (${warning})` : `Running ${name}`);
+    await this.flush(true);
+  }
+
+  async recordToolResult(data: Record<string, unknown>) {
+    const name = readStringField(data, "name") ?? "tool";
+    this.toolNames.add(name);
+    const error = summarizeToolError(data.result);
+    if (error) {
+      this.errorCount += 1;
+      this.pushLine(`Finished ${name}: error - ${error}`);
+    } else {
+      this.pushLine(`Finished ${name}`);
+    }
+    await this.flush(false);
+  }
+
+  async recordApprovalRequired(data: { message?: string; approval?: unknown }) {
+    this.flushAssistantPreviewLine();
+    const approval = data.approval as { toolName?: unknown } | undefined;
+    const name = typeof approval?.toolName === "string" ? approval.toolName : undefined;
+    this.pushLine(name ? `Waiting for approval: ${name}` : "Waiting for tool approval");
+    await this.flush(true);
+  }
+
+  async finish() {
+    if (!this.messageId) return;
+    const summary = this.finalSummary();
+    if (!summary || summary === this.lastText) return;
+    await editTelegramMessage(this.env, this.incoming.chatId, this.messageId, summary).catch(() => undefined);
+    this.lastText = summary;
+  }
+
+  private flushAssistantPreviewLine() {
+    if (this.assistantPreviewSent) return;
+    const preview = compactPreview(this.assistantBuffer, TELEGRAM_STATUS_PREVIEW_CHARS);
+    if (!preview) return;
+    this.pushLine(`Assistant: ${preview}`);
+    this.assistantPreviewSent = true;
+  }
+
+  private async flush(force: boolean) {
+    const now = Date.now();
+    if (!force && now - this.lastEditAt < TELEGRAM_STATUS_EDIT_INTERVAL_MS) return;
+    const text = this.render();
+    if (!text || text === this.lastText) return;
+
+    if (!this.messageId) {
+      const message = await sendTelegramMessage(
+        this.env,
+        this.incoming.chatId,
+        text,
+        this.incoming.messageId,
+      );
+      this.messageId = message.message_id;
+    } else {
+      await editTelegramMessage(this.env, this.incoming.chatId, this.messageId, text);
+    }
+    this.lastText = text;
+    this.lastEditAt = now;
+  }
+
+  private pushLine(line: string) {
+    const trimmed = compactPreview(line, TELEGRAM_STATUS_PREVIEW_CHARS);
+    if (!trimmed) return;
+    const previous = this.lines[this.lines.length - 1];
+    if (previous === trimmed) return;
+    this.lines.push(trimmed);
+    while (this.lines.length > TELEGRAM_STATUS_MAX_LINES) {
+      this.lines.shift();
+    }
+  }
+
+  private render() {
+    if (this.lines.length === 0) return "";
+    return ["Progress", ...this.lines.map((line) => `- ${line}`)].join("\n");
+  }
+
+  private finalSummary() {
+    if (this.toolCount === 0 && this.lines.length === 0) return "";
+    const tools = [...this.toolNames].slice(0, 4).join(", ");
+    const suffix = this.toolNames.size > 4 ? `, +${this.toolNames.size - 4} more` : "";
+    const status = this.errorCount > 0 ? `${this.errorCount} error${this.errorCount === 1 ? "" : "s"}` : "ok";
+    return tools
+      ? `Progress\n- Ran ${this.toolCount} tool${this.toolCount === 1 ? "" : "s"}: ${tools}${suffix}\n- Status: ${status}`
+      : this.render();
   }
 }
 
@@ -1910,6 +2048,25 @@ function withFinalTelegramFormatting(options: TelegramFinishOptions): TelegramFi
 function formatTelegramStreamPreview(content: string, showCursor: boolean) {
   const text = content.trim() || "Working...";
   return showCursor ? `${text}${TELEGRAM_STREAM_CURSOR}` : text;
+}
+
+function readStringField(data: Record<string, unknown>, key: string) {
+  const value = data[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function compactPreview(value: string, maxChars: number) {
+  const compacted = value.replace(/\s+/g, " ").trim();
+  if (!compacted) return "";
+  return compacted.length > maxChars ? `${compacted.slice(0, maxChars - 3)}...` : compacted;
+}
+
+function summarizeToolError(result: unknown) {
+  if (!result || typeof result !== "object") return undefined;
+  const record = result as Record<string, unknown>;
+  const error = record.error ?? record.message;
+  if (typeof error !== "string" || !error.trim()) return undefined;
+  return compactPreview(error, 120);
 }
 
 export function resolveTelegramStreamTransport(value: string | undefined): TelegramStreamTransport {
@@ -2642,7 +2799,7 @@ export function parseTelegramReminderArgs(
         : unit === "h" || unit === "hr" || unit.startsWith("hour") || unit === "小时" || unit === "时"
           ? 60 * 60_000
           : 24 * 60 * 60_000;
-    return normalizeReminderResult(now + amount * multiplier, relative[3]);
+    return normalizeReminderResult(now + amount * multiplier, relative[3], now);
   }
 
   const dayTime = /^(today|tomorrow|今天|明天)\s*(\d{1,2})[:：](\d{2})\s*([\s\S]+)$/i.exec(text);

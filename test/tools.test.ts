@@ -26,6 +26,8 @@ describe("tool registry", () => {
       "arxiv_search",
       "calculate",
       "current_time",
+      "delete_mcp_server",
+      "delete_skill",
       "fetch_url",
       "github_get_repository",
       "github_read_file",
@@ -33,6 +35,9 @@ describe("tool registry", () => {
       "http_request",
       "save_memory",
       "search_memory",
+      "skill",
+      "upsert_mcp_server",
+      "upsert_skill",
     ]);
     expect(tools.find((tool) => tool.function.name === "fetch_url")?.function.parameters).toMatchObject({
       type: "object",
@@ -50,6 +55,8 @@ describe("tool registry", () => {
     expect(createDefaultToolRegistry().get("arxiv_search")?.toolset).toBe("research");
     expect(createDefaultToolRegistry().get("github_search_repositories")?.toolset).toBe("github");
     expect(createDefaultToolRegistry().get("save_memory")?.toolset).toBe("memory");
+    expect(createDefaultToolRegistry().get("skill")?.toolset).toBe("skills");
+    expect(createDefaultToolRegistry().get("upsert_mcp_server")?.toolset).toBe("mcp");
   });
 
   it("rejects duplicate tool names", () => {
