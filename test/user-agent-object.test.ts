@@ -7,6 +7,7 @@ import type { ChatRequest, Env, LlmConfig, StoredMemory } from "../src/worker/ty
 describe("UserAgentObject run state", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
   it("collects messages while waiting for approval and resumes them after approval", async () => {
@@ -168,6 +169,117 @@ describe("UserAgentObject run state", () => {
     });
   });
 
+  it("stores tasks and reschedules reminder alarms", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-15T10:00:00Z"));
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql);
+    const dueAt = Date.now() + 60_000;
+
+    const create = await object.fetch(
+      jsonRequest("/tasks", {
+        source: { channel: "telegram", chatId: "123" },
+        title: "pay the bill",
+        dueAt,
+      }),
+    );
+
+    expect(create.status).toBe(200);
+    const created = (await create.json()) as { task: { id: string } };
+    expect(sql.tasks).toHaveLength(1);
+    expect(sql.alarm).toBe(dueAt);
+
+    const list = await object.fetch(
+      new Request("https://agent.test/tasks?channel=telegram&chatId=123&status=pending"),
+    );
+    await expect(list.json()).resolves.toMatchObject({
+      ok: true,
+      tasks: [{ id: created.task.id, title: "pay the bill", status: "pending" }],
+    });
+
+    const done = await object.fetch(
+      jsonRequest(`/tasks/${created.task.id}/done`, {
+        source: { channel: "telegram", chatId: "123" },
+      }),
+    );
+
+    expect(done.status).toBe(200);
+    expect(sql.tasks[0]?.status).toBe("done");
+    expect(sql.alarm).toBeNull();
+  });
+
+  it("sends due Telegram reminders from Durable Object alarms", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-15T10:00:00Z"));
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql, { TELEGRAM_BOT_TOKEN: "bot-token" });
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ ok: true })));
+
+    await object.fetch(
+      jsonRequest("/tasks", {
+        source: { channel: "telegram", chatId: "123" },
+        title: "stand up",
+        dueAt: Date.now() - 1,
+      }),
+    );
+    await object.alarm();
+
+    expect(fetch).toHaveBeenCalledWith(
+      "https://api.telegram.org/botbot-token/sendMessage",
+      expect.objectContaining({
+        body: JSON.stringify({
+          chat_id: "123",
+          text: "Reminder:\nstand up",
+        }),
+      }),
+    );
+    expect(sql.tasks[0]?.status).toBe("done");
+    expect(sql.tasks[0]?.notified_at).toBe(Date.now());
+  });
+
+  it("resolves AI Gateway LLM profile metadata into a base URL", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql, { OPENROUTER_API_KEY: "secret-key" } as Partial<Env>);
+
+    const update = await object.fetch(
+      jsonRequest(
+        "/settings/llm",
+        {
+          activeProfileId: "gateway",
+          profiles: [
+            {
+              id: "gateway",
+              aiGateway: {
+                accountId: "account123",
+                gatewayId: "my-gateway",
+                provider: "openrouter",
+              },
+              model: "openai/gpt-5-mini",
+              apiKeyEnv: "OPENROUTER_API_KEY",
+            },
+          ],
+        },
+        "PUT",
+      ),
+    );
+
+    expect(update.status).toBe(200);
+    await expect(update.json()).resolves.toMatchObject({
+      ok: true,
+      summary: {
+        activeProfileId: "gateway",
+        profiles: [
+          {
+            id: "gateway",
+            baseUrl: "https://gateway.ai.cloudflare.com/v1/account123/my-gateway/openrouter",
+            hasApiKey: true,
+          },
+        ],
+      },
+    });
+    expect(sql.runtimeSettings[0]?.value_json).not.toContain("secret-key");
+  });
+
   it("rejects secret-bearing LLM extra headers", async () => {
     const sql = new FakeSqlStorage();
     const object = createObject(sql);
@@ -203,7 +315,15 @@ describe("UserAgentObject run state", () => {
 
 function createObject(sql: FakeSqlStorage, env: Partial<Env> = {}) {
   const ctx = {
-    storage: { sql },
+    storage: {
+      sql,
+      setAlarm: async (timestamp: number) => {
+        sql.alarm = timestamp;
+      },
+      deleteAlarm: async () => {
+        sql.alarm = null;
+      },
+    },
     waitUntil(promise: Promise<unknown>) {
       void promise.catch(() => undefined);
     },
@@ -396,10 +516,24 @@ interface RuntimeSettingRow {
   updated_at: number;
 }
 
+interface TaskRow {
+  id: string;
+  channel: string;
+  chat_id: string;
+  title: string;
+  status: "pending" | "done";
+  due_at: number | null;
+  created_at: number;
+  completed_at: number | null;
+  notified_at: number | null;
+}
+
 class FakeSqlStorage {
   readonly memories: StoredMemory[] = [];
   readonly pendingApprovals: PendingApprovalRow[] = [];
   readonly runtimeSettings: RuntimeSettingRow[] = [];
+  readonly tasks: TaskRow[] = [];
+  alarm: number | null = null;
 
   exec(sql: string, ...bindings: Array<string | number | null>) {
     const normalized = sql.replace(/\s+/g, " ").trim();
@@ -465,6 +599,98 @@ class FakeSqlStorage {
     if (normalized === "DELETE FROM runtime_settings WHERE key = ?") {
       this.deleteRows(this.runtimeSettings, (setting) => setting.key === bindings[0]);
       return [];
+    }
+
+    if (normalized.startsWith("INSERT INTO tasks")) {
+      const [id, channel, chatId, title, status, dueAt, createdAt, completedAt, notifiedAt] = bindings;
+      this.tasks.push({
+        id: String(id),
+        channel: String(channel),
+        chat_id: String(chatId),
+        title: String(title),
+        status: status === "done" ? "done" : "pending",
+        due_at: typeof dueAt === "number" ? dueAt : null,
+        created_at: Number(createdAt),
+        completed_at: typeof completedAt === "number" ? completedAt : null,
+        notified_at: typeof notifiedAt === "number" ? notifiedAt : null,
+      });
+      return [];
+    }
+
+    if (normalized.startsWith("UPDATE tasks SET status = 'done', notified_at")) {
+      const [notifiedAt, completedAt, id] = bindings;
+      const task = this.tasks.find((item) => item.id === id);
+      if (task) {
+        task.status = "done";
+        task.notified_at ??= Number(notifiedAt);
+        task.completed_at ??= Number(completedAt);
+      }
+      return [];
+    }
+
+    if (normalized.startsWith("UPDATE tasks SET status = 'done'")) {
+      const [completedAt, id] = bindings;
+      const task = this.tasks.find((item) => item.id === id);
+      if (task) {
+        task.status = "done";
+        task.completed_at ??= Number(completedAt);
+      }
+      return [];
+    }
+
+    if (normalized === "DELETE FROM tasks WHERE id = ?") {
+      this.deleteRows(this.tasks, (task) => task.id === bindings[0]);
+      return [];
+    }
+
+    if (normalized === "SELECT id FROM tasks ORDER BY created_at DESC") {
+      return this.sortedTasks().map(({ id }) => ({ id }));
+    }
+
+    if (normalized.startsWith("SELECT MIN(due_at) AS due_at FROM tasks")) {
+      const dueTasks = this.tasks
+        .filter((task) => task.status === "pending" && typeof task.due_at === "number")
+        .map((task) => task.due_at as number);
+      return [{ due_at: dueTasks.length ? Math.min(...dueTasks) : null }];
+    }
+
+    if (normalized.includes("FROM tasks WHERE status = 'pending' AND due_at IS NOT NULL AND due_at <= ?")) {
+      const [now, limit] = bindings;
+      return this.sortedTasks()
+        .filter(
+          (task) =>
+            task.status === "pending" &&
+            typeof task.due_at === "number" &&
+            task.due_at <= Number(now),
+        )
+        .slice(0, Number(limit));
+    }
+
+    if (normalized.includes("FROM tasks WHERE channel = ? AND chat_id = ? AND status = ?")) {
+      const [channel, chatId, status, limit] = bindings;
+      return this.sortedTasks()
+        .filter(
+          (task) =>
+            task.channel === channel &&
+            task.chat_id === chatId &&
+            task.status === status,
+        )
+        .slice(0, Number(limit));
+    }
+
+    if (normalized.includes("FROM tasks WHERE channel = ? AND chat_id = ?")) {
+      const [channel, chatId, limit] = bindings;
+      return this.sortedTasks()
+        .filter((task) => task.channel === channel && task.chat_id === chatId)
+        .slice(0, Number(limit));
+    }
+
+    if (normalized.includes("FROM tasks WHERE id = ?")) {
+      return this.tasks.filter((task) => task.id === bindings[0]).slice(0, 1);
+    }
+
+    if (normalized.includes("FROM tasks ORDER BY CASE WHEN status = 'pending'")) {
+      return this.sortedTasks().slice(0, Number(bindings[0]));
     }
 
     if (normalized.startsWith("INSERT INTO pending_approvals")) {
@@ -534,6 +760,15 @@ class FakeSqlStorage {
     return this.pendingApprovals
       .slice()
       .sort((left, right) => right.created_at - left.created_at);
+  }
+
+  private sortedTasks() {
+    return this.tasks.slice().sort((left, right) => {
+      if (left.status !== right.status) return left.status === "pending" ? -1 : 1;
+      const leftDue = left.due_at ?? Number.POSITIVE_INFINITY;
+      const rightDue = right.due_at ?? Number.POSITIVE_INFINITY;
+      return leftDue - rightDue || right.created_at - left.created_at;
+    });
   }
 
   private deleteRows<T>(rows: T[], predicate: (row: T) => boolean) {

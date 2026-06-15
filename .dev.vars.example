@@ -8,6 +8,7 @@ TELEGRAM_ALLOW_ALL_CHATS=false
 TELEGRAM_ADMIN_USER_IDS=
 TELEGRAM_STREAM_TRANSPORT=auto
 TELEGRAM_TEXT_BATCH_MS=180
+TELEGRAM_TIME_ZONE=Asia/Shanghai
 
 # Server-side LLM config used by Telegram and the HTTP test channel.
 LLM_BASE_URL=https://api.openai.com/v1

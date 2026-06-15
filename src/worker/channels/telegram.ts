@@ -3,7 +3,14 @@ import { fetchAgentObject } from "./agent-object";
 import { resolveRequiredChannelLlm } from "./llm-config";
 import { readServerSentEvents } from "./sse";
 import type { AgentStreamEvent, ChannelAdapter, ChannelCapabilities } from "./types";
-import type { ActiveAgentRun, Env, LlmConfig, PendingToolApproval, StoredMemory } from "../types";
+import type {
+  ActiveAgentRun,
+  Env,
+  LlmConfig,
+  PendingToolApproval,
+  StoredMemory,
+  StoredTask,
+} from "../types";
 import { parseTelegramLlmEnv, TelegramUpdateSchema } from "../validation";
 
 const TELEGRAM_API_BASE = "https://api.telegram.org";
@@ -21,7 +28,23 @@ const TELEGRAM_TEXT_BATCH_DEFAULT_MS = 180;
 const TELEGRAM_TEXT_BATCH_MAX_MS = 1_000;
 const TELEGRAM_TEXT_BATCH_MAX_MESSAGES = 6;
 const TELEGRAM_TEXT_BATCH_MAX_CHARS = 16_000;
-const MUTATING_COMMANDS = new Set(["approve", "deny", "forget", "stop", "new", "reset", "llmuse"]);
+const TELEGRAM_FILE_MAX_BYTES = 256 * 1024;
+const TELEGRAM_FILE_MAX_TEXT_CHARS = 12_000;
+const TELEGRAM_DEFAULT_TIME_ZONE = "Asia/Shanghai";
+const MUTATING_COMMANDS = new Set([
+  "approve",
+  "deny",
+  "forget",
+  "remember",
+  "stop",
+  "new",
+  "reset",
+  "llmuse",
+  "remind",
+  "task",
+  "todo",
+  "done",
+]);
 
 type TelegramStreamTransport = "auto" | "draft" | "edit" | "off";
 type TelegramStreamMode = "draft" | "edit" | "off";
@@ -35,6 +58,8 @@ interface TelegramUpdate {
 interface TelegramMessage {
   message_id: number;
   text?: string;
+  caption?: string;
+  document?: TelegramDocument;
   chat: {
     id: string;
     type: string;
@@ -44,6 +69,13 @@ interface TelegramMessage {
     username?: string;
     first_name?: string;
   };
+}
+
+interface TelegramDocument {
+  file_id: string;
+  file_name?: string;
+  mime_type?: string;
+  file_size?: number;
 }
 
 interface TelegramCallbackQuery {
@@ -67,8 +99,29 @@ interface IncomingTelegramText {
 
 interface IncomingTelegramCallback extends IncomingTelegramText {
   callbackQueryId: string;
-  action: "approve" | "deny";
-  approvalId: string;
+  action: TelegramCallbackAction;
+}
+
+interface IncomingTelegramFile {
+  chatId: string;
+  chatType: string;
+  fromUserId?: string;
+  messageId: number;
+  fileId: string;
+  fileName?: string;
+  mimeType?: string;
+  fileSize?: number;
+  caption?: string;
+}
+
+type TelegramCallbackAction =
+  | { kind: "approval"; action: "approve" | "deny"; approvalId: string }
+  | { kind: "menu"; view: "home" | "status" | "llm" | "memory" | "tasks" | "pending" | "stop" }
+  | { kind: "memory_delete"; memoryId: string }
+  | { kind: "task_done"; taskId: string };
+interface TelegramCallbackParseResult {
+  action: TelegramCallbackAction;
+  text: string;
 }
 
 interface TelegramApiResponse<T> {
@@ -100,6 +153,7 @@ interface TelegramFinishOptions {
 
 interface AgentStateResponse {
   memories?: StoredMemory[];
+  tasks?: StoredTask[];
   pendingApprovals?: PendingToolApproval[];
   activeRuns?: ActiveAgentRun[];
   llm?: LlmSettingsResponse["summary"] & { source?: string };
@@ -169,7 +223,8 @@ export async function handleTelegramWebhook(
   const update = updateResult.data as TelegramUpdate;
   const callback = extractTelegramCallback(update);
   const incoming = extractTelegramText(update);
-  if (!callback && !incoming) {
+  const incomingFile = extractTelegramFile(update);
+  if (!callback && !incoming && !incomingFile) {
     return Response.json({ ok: true, ignored: "unsupported_update" });
   }
 
@@ -203,7 +258,28 @@ export async function handleTelegramWebhook(
   }
 
   if (!incoming) {
-    return Response.json({ ok: true, ignored: "unsupported_update" });
+    if (!incomingFile) {
+      return Response.json({ ok: true, ignored: "unsupported_update" });
+    }
+
+    if (!isChatAllowed(incomingFile.chatId, env)) {
+      return Response.json({ ok: true, ignored: "chat_not_allowed" });
+    }
+
+    const work = handleAllowedTelegramFile(request.url, env, incomingFile).catch(
+      async (error: unknown) => {
+        const message = error instanceof Error ? error.message : "Telegram file request failed.";
+        await sendTelegramMessage(env, incomingFile.chatId, `Error: ${message}`, incomingFile.messageId);
+      },
+    );
+
+    if (ctx) {
+      ctx.waitUntil(work);
+      return Response.json({ ok: true, accepted: true });
+    }
+
+    await work;
+    return Response.json({ ok: true });
   }
 
   const command = parseSlashCommand(incoming.text);
@@ -297,15 +373,58 @@ async function handleTelegramCallbackQuery(
     return;
   }
 
-  if (callback.action === "deny") {
+  if (callback.action.kind === "approval") {
+    await handleApprovalCallback(requestUrl, env, callback, command);
+    return;
+  }
+
+  if (callback.action.kind === "menu") {
+    await handleMenuCallback(requestUrl, env, callback);
+    return;
+  }
+
+  if (callback.action.kind === "memory_delete") {
+    await deleteMemoryById(env, requestUrl, callback.action.memoryId);
+    await answerTelegramCallbackQuery(env, callback.callbackQueryId, "Memory deleted.");
+    await editTelegramMessage(
+      env,
+      callback.chatId,
+      callback.messageId,
+      await memoryText(env, requestUrl),
+      { replyMarkup: await memoryReplyMarkup(env, requestUrl) },
+    );
+    return;
+  }
+
+  await completeTaskById(env, requestUrl, callback.chatId, callback.action.taskId);
+  await answerTelegramCallbackQuery(env, callback.callbackQueryId, "Task done.");
+  await editTelegramMessage(
+    env,
+    callback.chatId,
+    callback.messageId,
+    await tasksText(env, requestUrl, callback.chatId),
+    { replyMarkup: await tasksReplyMarkup(env, requestUrl, callback.chatId) },
+  );
+}
+
+async function handleApprovalCallback(
+  requestUrl: string,
+  env: Env,
+  callback: IncomingTelegramCallback,
+  command: SlashCommand | null,
+) {
+  if (callback.action.kind !== "approval") return;
+  const approvalAction = callback.action;
+
+  if (approvalAction.action === "deny") {
     try {
-      await denyApproval(env, requestUrl, callback.chatId, callback.approvalId);
+      await denyApproval(env, requestUrl, callback.chatId, approvalAction.approvalId);
       await answerTelegramCallbackQuery(env, callback.callbackQueryId, "Denied.");
       await editTelegramMessage(
         env,
         callback.chatId,
         callback.messageId,
-        `Denied approval: ${callback.approvalId}`,
+        `Denied approval: ${approvalAction.approvalId}`,
         { replyMarkup: emptyTelegramInlineKeyboard() },
       );
     } catch (error) {
@@ -331,13 +450,13 @@ async function handleTelegramCallbackQuery(
     env,
     callback.chatId,
     callback.messageId,
-    `Approved: ${callback.approvalId}\nRunning tool...`,
+    `Approved: ${approvalAction.approvalId}\nRunning tool...`,
     { replyMarkup: emptyTelegramInlineKeyboard() },
   );
   try {
     await handleApproveCommand(env, requestUrl, callback, command ?? {
       name: "approve",
-      args: callback.approvalId,
+      args: approvalAction.approvalId,
       raw: callback.text,
       botName: undefined,
     });
@@ -350,6 +469,41 @@ async function handleTelegramCallbackQuery(
       { replyMarkup: emptyTelegramInlineKeyboard() },
     ).catch(() => undefined);
   }
+}
+
+async function handleMenuCallback(
+  requestUrl: string,
+  env: Env,
+  callback: IncomingTelegramCallback,
+) {
+  if (callback.action.kind !== "menu") return;
+  const view = callback.action.view;
+
+  if (view === "stop") {
+    const response = await stopTelegramRun(env, requestUrl, callback.chatId);
+    await answerTelegramCallbackQuery(
+      env,
+      callback.callbackQueryId,
+      response.stopped ? "Stopped." : "No active response.",
+    );
+    await editTelegramMessage(
+      env,
+      callback.chatId,
+      callback.messageId,
+      response.stopped ? "Stopped active response." : "No active response in this chat.",
+      { replyMarkup: telegramMenuReplyMarkup() },
+    );
+    return;
+  }
+
+  await answerTelegramCallbackQuery(env, callback.callbackQueryId, "Updated.");
+  await editTelegramMessage(
+    env,
+    callback.chatId,
+    callback.messageId,
+    await menuViewText(env, requestUrl, callback.chatId, view),
+    { replyMarkup: await menuViewReplyMarkup(env, requestUrl, callback.chatId, view) },
+  );
 }
 
 async function handleAllowedTelegramMessage(
@@ -373,6 +527,15 @@ async function handleAllowedTelegramMessage(
     case "help":
       await sendTelegramMessage(env, incoming.chatId, helpText(), incoming.messageId);
       return;
+    case "menu":
+      await sendTelegramMessage(
+        env,
+        incoming.chatId,
+        menuHomeText(),
+        incoming.messageId,
+        { replyMarkup: telegramMenuReplyMarkup() },
+      );
+      return;
     case "status":
       await sendTelegramMessage(
         env,
@@ -387,7 +550,30 @@ async function handleAllowedTelegramMessage(
         incoming.chatId,
         await memoryText(env, requestUrl),
         incoming.messageId,
+        { replyMarkup: await memoryReplyMarkup(env, requestUrl) },
       );
+      return;
+    case "remember":
+      await handleRememberCommand(env, requestUrl, incoming, command);
+      return;
+    case "task":
+    case "todo":
+      await handleTaskCommand(env, requestUrl, incoming, command);
+      return;
+    case "remind":
+      await handleRemindCommand(env, requestUrl, incoming, command);
+      return;
+    case "tasks":
+      await sendTelegramMessage(
+        env,
+        incoming.chatId,
+        await tasksText(env, requestUrl, incoming.chatId),
+        incoming.messageId,
+        { replyMarkup: await tasksReplyMarkup(env, requestUrl, incoming.chatId) },
+      );
+      return;
+    case "done":
+      await handleDoneCommand(env, requestUrl, incoming, command);
       return;
     case "llm":
       await sendTelegramMessage(
@@ -439,8 +625,14 @@ function helpText() {
     "Agent Worker is connected.",
     "",
     "Commands:",
+    "/menu - show inline action menu",
     "/status - show runtime status",
     "/memory - list saved memories",
+    "/remember <text> - save a memory",
+    "/task <text> - add a task",
+    "/remind <when> <text> - add a reminder",
+    "/tasks - list pending tasks",
+    "/done <task_id> - mark a task done",
     "/llm - show LLM profiles",
     "/llmuse <profile_id> - switch active LLM profile",
     "/llmtest - test the active LLM profile",
@@ -465,10 +657,68 @@ async function statusText(env: Env, requestUrl: string) {
     "Status: ok",
     `Model: ${activeLlm}`,
     `Memories: ${state.memories?.length ?? 0}`,
+    `Tasks: ${state.tasks?.filter((task) => task.status === "pending").length ?? 0}`,
     `Pending approvals: ${state.pendingApprovals?.length ?? 0}`,
     `Active runs: ${state.activeRuns?.length ?? 0}`,
     `Queued follow-ups: ${queuedFollowUps}`,
   ].join("\n");
+}
+
+function menuHomeText() {
+  return "Agent menu";
+}
+
+async function menuViewText(
+  env: Env,
+  requestUrl: string,
+  chatId: string,
+  view: Extract<TelegramCallbackAction, { kind: "menu" }>["view"],
+) {
+  switch (view) {
+    case "status":
+      return statusText(env, requestUrl);
+    case "llm":
+      return llmSettingsText(env, requestUrl);
+    case "memory":
+      return memoryText(env, requestUrl);
+    case "tasks":
+      return tasksText(env, requestUrl, chatId);
+    case "pending":
+      return pendingApprovalsText(env, requestUrl, chatId);
+    case "home":
+    case "stop":
+      return menuHomeText();
+  }
+}
+
+async function menuViewReplyMarkup(
+  env: Env,
+  requestUrl: string,
+  chatId: string,
+  view: Extract<TelegramCallbackAction, { kind: "menu" }>["view"],
+) {
+  if (view === "memory") return memoryReplyMarkup(env, requestUrl);
+  if (view === "tasks") return tasksReplyMarkup(env, requestUrl, chatId);
+  return telegramMenuReplyMarkup();
+}
+
+function telegramMenuReplyMarkup(): TelegramReplyMarkup {
+  return {
+    inline_keyboard: [
+      [
+        telegramButton("Status", "menu:status"),
+        telegramButton("LLM", "menu:llm"),
+      ],
+      [
+        telegramButton("Memory", "menu:memory"),
+        telegramButton("Tasks", "menu:tasks"),
+      ],
+      [
+        telegramButton("Pending", "menu:pending"),
+        telegramButton("Stop", "menu:stop"),
+      ],
+    ],
+  };
 }
 
 async function memoryText(env: Env, requestUrl: string) {
@@ -480,6 +730,53 @@ async function memoryText(env: Env, requestUrl: string) {
     .slice(0, 12)
     .map((memory) => `${memory.id}: ${memory.content}`)
     .join("\n\n");
+}
+
+async function memoryReplyMarkup(env: Env, requestUrl: string) {
+  const state = await fetchAgentState(env, requestUrl);
+  const memories = (state.memories ?? []).slice(0, 10);
+  if (memories.length === 0) return telegramMenuReplyMarkup();
+  return {
+    inline_keyboard: [
+      ...memories.map((memory) => [
+        telegramButton(`Delete ${shortId(memory.id)}`, `memdel:${memory.id}`),
+      ]),
+      [telegramButton("Back", "menu:home")],
+    ],
+  };
+}
+
+async function handleRememberCommand(
+  env: Env,
+  requestUrl: string,
+  incoming: IncomingTelegramText,
+  command: SlashCommand,
+) {
+  const content = command.args.trim();
+  if (!content) {
+    await sendTelegramMessage(env, incoming.chatId, "Usage: /remember <text>", incoming.messageId);
+    return;
+  }
+
+  const response = await fetchAgentObject(env, requestUrl, "/memories", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+  const body = (await response.json().catch(() => ({}))) as {
+    memory?: StoredMemory;
+    error?: string;
+  };
+  if (!response.ok || body.error) {
+    throw new Error(body.error || `Memory save failed: ${response.status}`);
+  }
+
+  await sendTelegramMessage(
+    env,
+    incoming.chatId,
+    `Saved memory: ${body.memory?.id ?? "ok"}`,
+    incoming.messageId,
+  );
 }
 
 async function llmSettingsText(env: Env, requestUrl: string) {
@@ -576,6 +873,95 @@ async function pendingApprovalsText(env: Env, requestUrl: string, chatId: string
   return approvals.map(formatPendingApproval).join("\n\n");
 }
 
+async function tasksText(env: Env, requestUrl: string, chatId: string) {
+  const tasks = await fetchTasks(env, requestUrl, chatId, "pending");
+  if (tasks.length === 0) return "No pending tasks.";
+
+  return tasks
+    .slice(0, 20)
+    .map((task) => formatTask(task, env.TELEGRAM_TIME_ZONE))
+    .join("\n\n");
+}
+
+async function tasksReplyMarkup(env: Env, requestUrl: string, chatId: string) {
+  const tasks = await fetchTasks(env, requestUrl, chatId, "pending");
+  if (tasks.length === 0) return telegramMenuReplyMarkup();
+  return {
+    inline_keyboard: [
+      ...tasks.slice(0, 10).map((task) => [
+        telegramButton(`Done ${shortId(task.id)}`, `tdone:${task.id}`),
+      ]),
+      [telegramButton("Back", "menu:home")],
+    ],
+  };
+}
+
+async function handleTaskCommand(
+  env: Env,
+  requestUrl: string,
+  incoming: IncomingTelegramText,
+  command: SlashCommand,
+) {
+  const title = command.args.trim();
+  if (!title) {
+    await sendTelegramMessage(env, incoming.chatId, `Usage: /${command.name} <text>`, incoming.messageId);
+    return;
+  }
+
+  const task = await createTask(env, requestUrl, incoming.chatId, title);
+  await sendTelegramMessage(
+    env,
+    incoming.chatId,
+    `Task added: ${task.id}`,
+    incoming.messageId,
+    { replyMarkup: await tasksReplyMarkup(env, requestUrl, incoming.chatId) },
+  );
+}
+
+async function handleRemindCommand(
+  env: Env,
+  requestUrl: string,
+  incoming: IncomingTelegramText,
+  command: SlashCommand,
+) {
+  const parsed = parseTelegramReminderArgs(
+    command.args,
+    Date.now(),
+    env.TELEGRAM_TIME_ZONE || TELEGRAM_DEFAULT_TIME_ZONE,
+  );
+  if (parsed instanceof Error) {
+    await sendTelegramMessage(env, incoming.chatId, parsed.message, incoming.messageId);
+    return;
+  }
+
+  const task = await createTask(env, requestUrl, incoming.chatId, parsed.title, parsed.dueAt);
+  await sendTelegramMessage(
+    env,
+    incoming.chatId,
+    [
+      `Reminder added: ${task.id}`,
+      `Due: ${formatTimestamp(task.due_at, env.TELEGRAM_TIME_ZONE)}`,
+    ].join("\n"),
+    incoming.messageId,
+  );
+}
+
+async function handleDoneCommand(
+  env: Env,
+  requestUrl: string,
+  incoming: IncomingTelegramText,
+  command: SlashCommand,
+) {
+  const taskId = firstArg(command.args);
+  if (!taskId) {
+    await sendTelegramMessage(env, incoming.chatId, "Usage: /done <task_id>", incoming.messageId);
+    return;
+  }
+
+  await completeTaskById(env, requestUrl, incoming.chatId, taskId);
+  await sendTelegramMessage(env, incoming.chatId, `Task done: ${taskId}`, incoming.messageId);
+}
+
 async function handleForgetCommand(
   env: Env,
   requestUrl: string,
@@ -588,12 +974,7 @@ async function handleForgetCommand(
     return;
   }
 
-  const response = await fetchAgentObject(env, requestUrl, `/memories/${encodeURIComponent(memoryId)}`, {
-    method: "DELETE",
-  });
-  if (!response.ok) {
-    throw new Error(`Memory delete failed: ${response.status}`);
-  }
+  await deleteMemoryById(env, requestUrl, memoryId);
 
   await sendTelegramMessage(env, incoming.chatId, `Deleted memory: ${memoryId}`, incoming.messageId);
 }
@@ -630,11 +1011,22 @@ async function handleStopCommand(
   incoming: IncomingTelegramText,
   commandName: string,
 ) {
+  const body = await stopTelegramRun(env, requestUrl, incoming.chatId);
+  const label = commandName === "stop" ? "Stopped active response." : "Started a fresh turn.";
+  await sendTelegramMessage(
+    env,
+    incoming.chatId,
+    body.stopped ? label : "No active response in this chat.",
+    incoming.messageId,
+  );
+}
+
+async function stopTelegramRun(env: Env, requestUrl: string, chatId: string) {
   const response = await fetchAgentObject(env, requestUrl, "/sessions/stop", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      source: { channel: "telegram", chatId: incoming.chatId },
+      source: { channel: "telegram", chatId },
     }),
   });
   const body = (await response.json().catch(() => ({}))) as {
@@ -645,13 +1037,7 @@ async function handleStopCommand(
     throw new Error(body.error || `Stop failed: ${response.status}`);
   }
 
-  const label = commandName === "stop" ? "Stopped active response." : "Started a fresh turn.";
-  await sendTelegramMessage(
-    env,
-    incoming.chatId,
-    body.stopped ? label : "No active response in this chat.",
-    incoming.messageId,
-  );
+  return body;
 }
 
 async function handleDenyCommand(
@@ -793,6 +1179,28 @@ async function handleAgentMessage(env: Env, requestUrl: string, incoming: Incomi
     },
     "Thinking...",
   );
+}
+
+async function handleAllowedTelegramFile(
+  requestUrl: string,
+  env: Env,
+  incoming: IncomingTelegramFile,
+) {
+  const fileCheck = validateTelegramTextFile(incoming);
+  if (fileCheck instanceof Error) {
+    await sendTelegramMessage(env, incoming.chatId, fileCheck.message, incoming.messageId);
+    return;
+  }
+
+  const fileText = await downloadTelegramTextFile(env, incoming);
+  const message = formatTelegramFilePrompt(incoming, fileText);
+  await handleAgentMessage(env, requestUrl, {
+    chatId: incoming.chatId,
+    chatType: incoming.chatType,
+    fromUserId: incoming.fromUserId,
+    messageId: incoming.messageId,
+    text: message,
+  });
 }
 
 async function streamAgentEndpointToTelegram(
@@ -1145,35 +1553,87 @@ function extractTelegramText(update: TelegramUpdate): IncomingTelegramText | nul
   };
 }
 
+function extractTelegramFile(update: TelegramUpdate): IncomingTelegramFile | null {
+  const message = update.message;
+  const document = message?.document;
+  if (!message || !document?.file_id) return null;
+
+  return {
+    chatId: message.chat.id,
+    chatType: message.chat.type,
+    fromUserId: typeof message.from?.id === "number" ? String(message.from.id) : undefined,
+    messageId: message.message_id,
+    fileId: document.file_id,
+    fileName: document.file_name,
+    mimeType: document.mime_type,
+    fileSize: document.file_size,
+    caption: message.caption,
+  };
+}
+
 function extractTelegramCallback(update: TelegramUpdate): IncomingTelegramCallback | null {
   const callbackQuery = update.callback_query;
   const data = callbackQuery?.data?.trim();
   const message = callbackQuery?.message;
   if (!callbackQuery || !data || !message) return null;
 
-  const parsed = parseApprovalCallbackData(data);
+  const parsed = parseTelegramCallbackData(data);
   if (!parsed) return null;
 
   return {
     callbackQueryId: callbackQuery.id,
     action: parsed.action,
-    approvalId: parsed.approvalId,
     chatId: message.chat.id,
     chatType: message.chat.type,
     fromUserId: typeof callbackQuery.from?.id === "number" ? String(callbackQuery.from.id) : undefined,
     messageId: message.message_id,
-    text: `/${parsed.action} ${parsed.approvalId}`,
+    text: parsed.text,
   };
 }
 
-function parseApprovalCallbackData(
-  data: string,
-): { action: "approve" | "deny"; approvalId: string } | null {
-  const [prefix, action, approvalId] = data.split(":");
+function parseTelegramCallbackData(data: string): TelegramCallbackParseResult | null {
+  const [prefix, action, value] = data.split(":");
   if (prefix !== TELEGRAM_APPROVAL_CALLBACK_PREFIX) return null;
-  if (action !== "approve" && action !== "deny") return null;
-  if (!approvalId) return null;
-  return { action, approvalId };
+  if ((action === "approve" || action === "deny") && value) {
+    return {
+      action: { kind: "approval", action, approvalId: value },
+      text: `/${action} ${value}`,
+    };
+  }
+  if (action === "menu" && isTelegramMenuView(value)) {
+    const commandName = value === "stop" ? "stop" : "menu";
+    return {
+      action: { kind: "menu", view: value },
+      text: `/${commandName}`,
+    };
+  }
+  if (action === "memdel" && value) {
+    return {
+      action: { kind: "memory_delete", memoryId: value },
+      text: `/forget ${value}`,
+    };
+  }
+  if (action === "tdone" && value) {
+    return {
+      action: { kind: "task_done", taskId: value },
+      text: `/done ${value}`,
+    };
+  }
+  return null;
+}
+
+function isTelegramMenuView(
+  value: string | undefined,
+): value is Extract<TelegramCallbackAction, { kind: "menu" }>["view"] {
+  return (
+    value === "home" ||
+    value === "status" ||
+    value === "llm" ||
+    value === "memory" ||
+    value === "tasks" ||
+    value === "pending" ||
+    value === "stop"
+  );
 }
 
 export function resolveTelegramTextBatchDelayMs(value: string | undefined) {
@@ -1280,6 +1740,76 @@ async function fetchPendingApprovals(env: Env, requestUrl: string, chatId: strin
     approvals?: PendingToolApproval[];
   };
   return body.approvals ?? [];
+}
+
+async function fetchTasks(
+  env: Env,
+  requestUrl: string,
+  chatId: string,
+  status?: "pending" | "done",
+) {
+  const params = new URLSearchParams({ channel: "telegram", chatId });
+  if (status) params.set("status", status);
+  const response = await fetchAgentObject(env, requestUrl, `/tasks?${params.toString()}`, {
+    method: "GET",
+  });
+  if (!response.ok) return [];
+  const body = (await response.json().catch(() => ({}))) as { tasks?: StoredTask[] };
+  return body.tasks ?? [];
+}
+
+async function createTask(
+  env: Env,
+  requestUrl: string,
+  chatId: string,
+  title: string,
+  dueAt?: number,
+) {
+  const response = await fetchAgentObject(env, requestUrl, "/tasks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      source: { channel: "telegram", chatId },
+      title,
+      ...(dueAt ? { dueAt } : {}),
+    }),
+  });
+  const body = (await response.json().catch(() => ({}))) as {
+    task?: StoredTask;
+    error?: string;
+  };
+  if (!response.ok || body.error || !body.task) {
+    throw new Error(body.error || `Task create failed: ${response.status}`);
+  }
+  return body.task;
+}
+
+async function completeTaskById(env: Env, requestUrl: string, chatId: string, taskId: string) {
+  const response = await fetchAgentObject(
+    env,
+    requestUrl,
+    `/tasks/${encodeURIComponent(taskId)}/done`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source: { channel: "telegram", chatId },
+      }),
+    },
+  );
+  const body = (await response.json().catch(() => ({}))) as { error?: string };
+  if (!response.ok || body.error) {
+    throw new Error(body.error || `Task update failed: ${response.status}`);
+  }
+}
+
+async function deleteMemoryById(env: Env, requestUrl: string, memoryId: string) {
+  const response = await fetchAgentObject(env, requestUrl, `/memories/${encodeURIComponent(memoryId)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    throw new Error(`Memory delete failed: ${response.status}`);
+  }
 }
 
 async function sendTelegramMessage(
@@ -1418,6 +1948,80 @@ async function sendTelegramDraft(env: Env, chatId: string, draftId: string, text
   });
 }
 
+function validateTelegramTextFile(file: IncomingTelegramFile) {
+  if (typeof file.fileSize === "number" && file.fileSize > TELEGRAM_FILE_MAX_BYTES) {
+    return new Error(`Text files must be ${Math.round(TELEGRAM_FILE_MAX_BYTES / 1024)}KB or smaller.`);
+  }
+  if (!isSupportedTelegramTextFile(file)) {
+    return new Error("Only text, Markdown, JSON, CSV, YAML, XML, and log files are supported for now.");
+  }
+  return null;
+}
+
+function isSupportedTelegramTextFile(file: Pick<IncomingTelegramFile, "fileName" | "mimeType">) {
+  const mime = file.mimeType?.toLowerCase() ?? "";
+  if (mime.startsWith("text/")) return true;
+  if (
+    [
+      "application/json",
+      "application/xml",
+      "application/yaml",
+      "application/x-yaml",
+      "application/toml",
+    ].includes(mime)
+  ) {
+    return true;
+  }
+
+  const name = file.fileName?.toLowerCase() ?? "";
+  return /\.(txt|md|markdown|json|jsonl|csv|tsv|yaml|yml|xml|toml|log)$/i.test(name);
+}
+
+async function downloadTelegramTextFile(env: Env, file: IncomingTelegramFile) {
+  const info = await telegramApi<{ file_path?: string; file_size?: number }>(env, "getFile", {
+    file_id: file.fileId,
+  });
+  if (!info?.file_path) {
+    throw new Error("Telegram did not return a file path.");
+  }
+  if (typeof info.file_size === "number" && info.file_size > TELEGRAM_FILE_MAX_BYTES) {
+    throw new Error(`Text files must be ${Math.round(TELEGRAM_FILE_MAX_BYTES / 1024)}KB or smaller.`);
+  }
+
+  const token = env.TELEGRAM_BOT_TOKEN?.trim();
+  if (!token) throw new Error("TELEGRAM_BOT_TOKEN is not configured.");
+  const response = await fetch(`${TELEGRAM_API_BASE}/file/bot${token}/${info.file_path}`);
+  if (!response.ok) {
+    throw new Error(`Telegram file download failed: ${response.status}`);
+  }
+  const contentLength = Number(response.headers.get("Content-Length"));
+  if (Number.isFinite(contentLength) && contentLength > TELEGRAM_FILE_MAX_BYTES) {
+    throw new Error(`Text files must be ${Math.round(TELEGRAM_FILE_MAX_BYTES / 1024)}KB or smaller.`);
+  }
+
+  const bytes = await response.arrayBuffer();
+  if (bytes.byteLength > TELEGRAM_FILE_MAX_BYTES) {
+    throw new Error(`Text files must be ${Math.round(TELEGRAM_FILE_MAX_BYTES / 1024)}KB or smaller.`);
+  }
+  return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+}
+
+function formatTelegramFilePrompt(file: IncomingTelegramFile, content: string) {
+  const trimmed = content.replace(/\u0000/g, "").slice(0, TELEGRAM_FILE_MAX_TEXT_CHARS);
+  const instruction = file.caption?.trim() || "Summarize this file and call out important action items.";
+  return [
+    `User instruction: ${instruction}`,
+    "",
+    `File: ${file.fileName ?? "telegram-file"}`,
+    file.mimeType ? `MIME: ${file.mimeType}` : "",
+    typeof file.fileSize === "number" ? `Size: ${file.fileSize} bytes` : "",
+    "",
+    "File content:",
+    trimmed,
+    content.length > trimmed.length ? "\n[truncated]" : "",
+  ].filter((line) => line !== "").join("\n");
+}
+
 async function telegramApi<T>(env: Env, method: string, payload: Record<string, unknown>) {
   const token = env.TELEGRAM_BOT_TOKEN;
   if (!token) throw new Error("TELEGRAM_BOT_TOKEN is not configured.");
@@ -1544,6 +2148,142 @@ function formatPendingApproval(approval: PendingToolApproval) {
     `/approve ${approval.id}`,
     `/deny ${approval.id}`,
   ].join("\n");
+}
+
+function formatTask(task: StoredTask, timeZone: string | undefined) {
+  return [
+    `${task.id}: ${task.title}`,
+    task.due_at ? `Due: ${formatTimestamp(task.due_at, timeZone)}` : "Due: none",
+  ].join("\n");
+}
+
+export function parseTelegramReminderArgs(
+  args: string,
+  now = Date.now(),
+  timeZone = TELEGRAM_DEFAULT_TIME_ZONE,
+): { dueAt: number; title: string } | Error {
+  const text = args.trim();
+  if (!text) return new Error("Usage: /remind <when> <text>");
+
+  const relative = /^(\d+)\s*(m|min|minute|minutes|分钟|分|h|hr|hour|hours|小时|时|d|day|days|天)(?:后)?\s+([\s\S]+)$/i.exec(text);
+  if (relative) {
+    const amount = Number(relative[1]);
+    const unit = relative[2].toLowerCase();
+    const multiplier =
+      unit === "m" || unit === "min" || unit.startsWith("minute") || unit === "分钟" || unit === "分"
+        ? 60_000
+        : unit === "h" || unit === "hr" || unit.startsWith("hour") || unit === "小时" || unit === "时"
+          ? 60 * 60_000
+          : 24 * 60 * 60_000;
+    return normalizeReminderResult(now + amount * multiplier, relative[3]);
+  }
+
+  const dayTime = /^(today|tomorrow|今天|明天)\s*(\d{1,2})[:：](\d{2})\s*([\s\S]+)$/i.exec(text);
+  if (dayTime) {
+    const dayOffset = dayTime[1].toLowerCase() === "tomorrow" || dayTime[1] === "明天" ? 1 : 0;
+    const dueAt = zonedDayTimeToEpoch(now, dayOffset, Number(dayTime[2]), Number(dayTime[3]), timeZone);
+    return normalizeReminderResult(dueAt, dayTime[4], now);
+  }
+
+  const isoDateTime = /^(\d{4}-\d{2}-\d{2}[T\s]\d{1,2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)\s+([\s\S]+)$/i.exec(text);
+  if (isoDateTime) {
+    const dueAt = Date.parse(isoDateTime[1].replace(" ", "T"));
+    return normalizeReminderResult(dueAt, isoDateTime[2], now);
+  }
+
+  return new Error("Usage: /remind 10m <text>, /remind tomorrow 09:00 <text>, or /remind 2026-06-15T09:00 <text>");
+}
+
+function normalizeReminderResult(dueAt: number, title: string, now = Date.now()) {
+  const normalizedTitle = title.trim();
+  if (!normalizedTitle) return new Error("Reminder text is required.");
+  if (!Number.isFinite(dueAt)) return new Error("Could not parse reminder time.");
+  if (dueAt <= now) return new Error("Reminder time must be in the future.");
+  return { dueAt: Math.round(dueAt), title: normalizedTitle };
+}
+
+function zonedDayTimeToEpoch(
+  now: number,
+  dayOffset: number,
+  hour: number,
+  minute: number,
+  timeZone: string,
+) {
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return Number.NaN;
+  const parts = zonedDateParts(now, timeZone);
+  const targetDate = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + dayOffset));
+  return zonedDateTimeToEpoch(
+    targetDate.getUTCFullYear(),
+    targetDate.getUTCMonth() + 1,
+    targetDate.getUTCDate(),
+    hour,
+    minute,
+    timeZone,
+  );
+}
+
+function zonedDateTimeToEpoch(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  timeZone: string,
+) {
+  let guess = Date.UTC(year, month - 1, day, hour, minute);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const actual = zonedDateParts(guess, timeZone);
+    const actualAsUtc = Date.UTC(
+      actual.year,
+      actual.month - 1,
+      actual.day,
+      actual.hour,
+      actual.minute,
+    );
+    const desiredAsUtc = Date.UTC(year, month - 1, day, hour, minute);
+    guess += desiredAsUtc - actualAsUtc;
+  }
+  return guess;
+}
+
+function zonedDateParts(timestamp: number, timeZone: string) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date(timestamp));
+  const value = (type: string) => Number(parts.find((part) => part.type === type)?.value);
+  return {
+    year: value("year"),
+    month: value("month"),
+    day: value("day"),
+    hour: value("hour") % 24,
+    minute: value("minute"),
+  };
+}
+
+function formatTimestamp(timestamp: number | null, timeZone: string | undefined) {
+  if (!timestamp) return "none";
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: timeZone || TELEGRAM_DEFAULT_TIME_ZONE,
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(timestamp));
+}
+
+function telegramButton(text: string, callbackData: string): TelegramInlineKeyboardButton {
+  return {
+    text,
+    callback_data: `${TELEGRAM_APPROVAL_CALLBACK_PREFIX}:${callbackData}`.slice(0, 64),
+  };
+}
+
+function shortId(id: string) {
+  return id.length <= 10 ? id : id.slice(0, 8);
 }
 
 function firstArg(args: string) {

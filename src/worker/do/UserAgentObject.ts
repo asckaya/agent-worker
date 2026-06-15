@@ -35,12 +35,15 @@ import type {
   LlmConfig,
   PendingToolApproval,
   StoredMemory,
+  StoredTask,
   ToolCall,
 } from "../types";
 import {
   parseApprovalActionPayload,
   parseChatRequestPayload,
   parseSessionControlPayload,
+  parseTaskActionPayload,
+  parseTaskCreatePayload,
 } from "../validation";
 
 const MAX_TOOL_STEPS = 4;
@@ -53,6 +56,8 @@ const MAX_TOOL_INPUT_JSON_CHARS = 8_000;
 const MAX_TOOL_RESULT_SUMMARY_CHARS = 12_000;
 const MAX_ACTIVE_RUN_FOLLOW_UPS = 3;
 const MAX_EPHEMERAL_HISTORY_MESSAGES = 8;
+const MAX_TASKS = 200;
+const TASK_ALARM_RETRY_DELAY_MS = 60_000;
 
 interface AgentCallbacks {
   onMeta?: (data: Record<string, unknown>) => Promise<void>;
@@ -77,6 +82,18 @@ interface RuntimeSettingRow {
   key: string;
   value_json: string;
   updated_at: number;
+}
+
+interface TaskRow {
+  id: string;
+  channel: string;
+  chat_id: string;
+  title: string;
+  status: "pending" | "done";
+  due_at: number | null;
+  created_at: number;
+  completed_at: number | null;
+  notified_at: number | null;
 }
 
 interface ActiveRunRecord extends Omit<ActiveAgentRun, "queuedMessageCount"> {
@@ -133,6 +150,7 @@ export class UserAgentObject {
     if (request.method === "GET" && url.pathname === "/state") {
       return Response.json({
         memories: this.getMemories(),
+        tasks: this.getTasks(),
         pendingApprovals: this.getPendingApprovals(),
         activeRuns: this.getActiveRuns(),
         llm: this.getLlmSettingsSummary(),
@@ -147,6 +165,31 @@ export class UserAgentObject {
 
     if (request.method === "POST" && url.pathname === "/memories") {
       return this.handleCreateMemory(request);
+    }
+
+    if (request.method === "GET" && url.pathname === "/tasks") {
+      return Response.json({
+        ok: true,
+        tasks: this.getTasks({
+          channel: url.searchParams.get("channel") ?? undefined,
+          chatId: url.searchParams.get("chatId") ?? undefined,
+          status: url.searchParams.get("status") ?? undefined,
+        }),
+      });
+    }
+
+    if (request.method === "POST" && url.pathname === "/tasks") {
+      return this.handleCreateTask(request);
+    }
+
+    const taskDoneMatch = /^\/tasks\/([^/]+)\/done$/.exec(url.pathname);
+    if (request.method === "POST" && taskDoneMatch) {
+      return this.handleCompleteTask(request, decodeURIComponent(taskDoneMatch[1]));
+    }
+
+    const taskDeleteMatch = /^\/tasks\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "DELETE" && taskDeleteMatch) {
+      return this.handleDeleteTask(request, decodeURIComponent(taskDeleteMatch[1]));
     }
 
     if (request.method === "GET" && url.pathname === "/settings/llm") {
@@ -218,6 +261,46 @@ export class UserAgentObject {
     return Response.json({ error: "Not found" }, { status: 404 });
   }
 
+  async alarm() {
+    const now = Date.now();
+    let shouldRetrySoon = false;
+
+    try {
+      const dueTasks = this.query<TaskRow>(
+        `
+          SELECT id, channel, chat_id, title, status, due_at, created_at, completed_at, notified_at
+          FROM tasks
+          WHERE status = 'pending' AND due_at IS NOT NULL AND due_at <= ?
+          ORDER BY due_at ASC
+          LIMIT ?
+        `,
+        now,
+        20,
+      ).map(rowToTask);
+
+      for (const task of dueTasks) {
+        try {
+          await this.notifyDueTask(task);
+          this.markTaskNotified(task.id);
+        } catch (error) {
+          console.warn("Task notification failed", {
+            taskId: task.id,
+            channel: task.channel,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          shouldRetrySoon = true;
+        }
+      }
+    } catch (error) {
+      console.warn("Task alarm failed", error instanceof Error ? error.message : String(error));
+      shouldRetrySoon = true;
+    } finally {
+      await this.scheduleNextTaskAlarm(
+        shouldRetrySoon ? Date.now() + TASK_ALARM_RETRY_DELAY_MS : undefined,
+      );
+    }
+  }
+
   private async handleCreateMemory(request: Request) {
     const body = (await request.json().catch(() => ({}))) as { content?: unknown };
     if (typeof body.content !== "string" || !body.content.trim()) {
@@ -226,6 +309,57 @@ export class UserAgentObject {
 
     const memory = this.saveMemory(body.content);
     return Response.json({ ok: true, memory, memories: this.getMemories() });
+  }
+
+  private async handleCreateTask(request: Request) {
+    try {
+      const payload = parseTaskCreatePayload(await request.json().catch(() => ({})));
+      const task = this.saveTask({
+        channel: payload.source.channel,
+        chatId: payload.source.chatId,
+        title: payload.title,
+        dueAt: payload.dueAt ?? null,
+      });
+      await this.scheduleNextTaskAlarm();
+      return Response.json({
+        ok: true,
+        task,
+        tasks: this.getTasks({
+          channel: payload.source.channel,
+          chatId: payload.source.chatId,
+        }),
+      });
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  private async handleCompleteTask(request: Request, taskId: string) {
+    try {
+      const payload = parseTaskActionPayload(await request.json().catch(() => ({})));
+      const task = this.getTask(taskId);
+      if (!task) throw new HttpError("Task not found.", 404);
+      this.assertTaskSource(task, payload.source);
+      const completed = this.completeTask(task.id);
+      await this.scheduleNextTaskAlarm();
+      return Response.json({ ok: true, task: completed });
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  private async handleDeleteTask(request: Request, taskId: string) {
+    try {
+      const payload = parseTaskActionPayload(await request.json().catch(() => ({})));
+      const task = this.getTask(taskId);
+      if (!task) throw new HttpError("Task not found.", 404);
+      this.assertTaskSource(task, payload.source);
+      this.deleteTask(task.id);
+      await this.scheduleNextTaskAlarm();
+      return Response.json({ ok: true, deleted: task });
+    } catch (error) {
+      return errorResponse(error);
+    }
   }
 
   private async handleUpdateLlmSettings(request: Request) {
@@ -776,6 +910,32 @@ export class UserAgentObject {
     return decorateRecoveryResult(toolResult, recovery);
   }
 
+  private async notifyDueTask(task: StoredTask) {
+    if (task.channel !== "telegram") return;
+    const token = this.env.TELEGRAM_BOT_TOKEN?.trim();
+    if (!token) {
+      throw new Error("TELEGRAM_BOT_TOKEN is not configured.");
+    }
+
+    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: task.chatId,
+        text: `Reminder:\n${task.title}`,
+      }),
+    });
+    const body = (await response.json().catch(() => ({}))) as {
+      ok?: boolean;
+      description?: string;
+    };
+    if (!response.ok || body.ok === false) {
+      throw new Error(
+        `Telegram reminder failed: ${response.status} ${body.description ?? ""}`.trim(),
+      );
+    }
+  }
+
   private ensureSchema() {
     this.memoryProvider.ensureSchema();
     this.ctx.storage.sql.exec(`
@@ -801,10 +961,222 @@ export class UserAgentObject {
       CREATE INDEX IF NOT EXISTS pending_approvals_chat_idx
       ON pending_approvals (channel, chat_id, created_at)
     `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        channel TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL,
+        due_at INTEGER,
+        created_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        notified_at INTEGER
+      )
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE INDEX IF NOT EXISTS tasks_chat_status_idx
+      ON tasks (channel, chat_id, status, created_at)
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE INDEX IF NOT EXISTS tasks_due_idx
+      ON tasks (status, due_at)
+    `);
   }
 
   private getMemories() {
     return this.memoryProvider.list();
+  }
+
+  private getTasks(filter: { channel?: string; chatId?: string; status?: string } = {}) {
+    const normalizedStatus = filter.status === "pending" || filter.status === "done"
+      ? filter.status
+      : undefined;
+
+    if (filter.channel && filter.chatId && normalizedStatus) {
+      return this.query<TaskRow>(
+        `
+          SELECT id, channel, chat_id, title, status, due_at, created_at, completed_at, notified_at
+          FROM tasks
+          WHERE channel = ? AND chat_id = ? AND status = ?
+          ORDER BY
+            CASE WHEN due_at IS NULL THEN 1 ELSE 0 END,
+            due_at ASC,
+            created_at DESC
+          LIMIT ?
+        `,
+        filter.channel,
+        filter.chatId,
+        normalizedStatus,
+        MAX_TASKS,
+      ).map(rowToTask);
+    }
+
+    if (filter.channel && filter.chatId) {
+      return this.query<TaskRow>(
+        `
+          SELECT id, channel, chat_id, title, status, due_at, created_at, completed_at, notified_at
+          FROM tasks
+          WHERE channel = ? AND chat_id = ?
+          ORDER BY CASE WHEN status = 'pending' THEN 0 ELSE 1 END,
+            CASE WHEN due_at IS NULL THEN 1 ELSE 0 END,
+            due_at ASC,
+            created_at DESC
+          LIMIT ?
+        `,
+        filter.channel,
+        filter.chatId,
+        MAX_TASKS,
+      ).map(rowToTask);
+    }
+
+    return this.query<TaskRow>(
+      `
+        SELECT id, channel, chat_id, title, status, due_at, created_at, completed_at, notified_at
+        FROM tasks
+        ORDER BY CASE WHEN status = 'pending' THEN 0 ELSE 1 END,
+          CASE WHEN due_at IS NULL THEN 1 ELSE 0 END,
+          due_at ASC,
+          created_at DESC
+        LIMIT ?
+      `,
+      MAX_TASKS,
+    ).map(rowToTask);
+  }
+
+  private getTask(id: string) {
+    if (!id) return null;
+    const row = this.query<TaskRow>(
+      `
+        SELECT id, channel, chat_id, title, status, due_at, created_at, completed_at, notified_at
+        FROM tasks
+        WHERE id = ?
+        LIMIT 1
+      `,
+      id,
+    )[0];
+    return row ? rowToTask(row) : null;
+  }
+
+  private saveTask(input: {
+    channel: string;
+    chatId: string;
+    title: string;
+    dueAt: number | null;
+  }) {
+    const now = Date.now();
+    const task: StoredTask = {
+      id: this.createTaskId(),
+      channel: input.channel,
+      chatId: input.chatId,
+      title: input.title.trim().replace(/\s+/g, " ").slice(0, MAX_MEMORY_CHARS),
+      status: "pending",
+      due_at: input.dueAt,
+      created_at: now,
+      completed_at: null,
+      notified_at: null,
+    };
+
+    if (!task.title) {
+      throw new HttpError("Task title is required.", 400);
+    }
+
+    this.ctx.storage.sql.exec(
+      `
+        INSERT INTO tasks
+          (id, channel, chat_id, title, status, due_at, created_at, completed_at, notified_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      task.id,
+      task.channel,
+      task.chatId,
+      task.title,
+      task.status,
+      task.due_at,
+      task.created_at,
+      task.completed_at,
+      task.notified_at,
+    );
+    this.pruneTasks();
+    return task;
+  }
+
+  private completeTask(id: string) {
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      `
+        UPDATE tasks
+        SET status = 'done',
+          completed_at = COALESCE(completed_at, ?)
+        WHERE id = ?
+      `,
+      now,
+      id,
+    );
+    const task = this.getTask(id);
+    if (!task) throw new HttpError("Task not found.", 404);
+    return task;
+  }
+
+  private markTaskNotified(id: string) {
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      `
+        UPDATE tasks
+        SET status = 'done',
+          notified_at = COALESCE(notified_at, ?),
+          completed_at = COALESCE(completed_at, ?)
+        WHERE id = ?
+      `,
+      now,
+      now,
+      id,
+    );
+  }
+
+  private deleteTask(id: string) {
+    this.ctx.storage.sql.exec("DELETE FROM tasks WHERE id = ?", id);
+  }
+
+  private pruneTasks() {
+    const overflow = this.query<{ id: string }>(
+      "SELECT id FROM tasks ORDER BY created_at DESC",
+    ).slice(MAX_TASKS);
+
+    for (const row of overflow) {
+      this.deleteTask(row.id);
+    }
+  }
+
+  private assertTaskSource(task: StoredTask, source: ChannelSource | undefined) {
+    if (!source) return;
+    if (task.channel !== source.channel || task.chatId !== source.chatId) {
+      throw new HttpError("Task not found for this channel.", 404);
+    }
+  }
+
+  private async scheduleNextTaskAlarm(fallbackAt?: number) {
+    const next = this.query<{ due_at: number | null }>(
+      `
+        SELECT MIN(due_at) AS due_at
+        FROM tasks
+        WHERE status = 'pending' AND due_at IS NOT NULL
+      `,
+    )[0]?.due_at;
+
+    if (typeof next === "number" && Number.isFinite(next)) {
+      await this.ctx.storage.setAlarm(
+        fallbackAt ? Math.min(next, fallbackAt) : Math.max(next, Date.now()),
+      );
+      return;
+    }
+
+    if (fallbackAt) {
+      await this.ctx.storage.setAlarm(fallbackAt);
+      return;
+    }
+
+    await this.ctx.storage.deleteAlarm();
   }
 
   private getActiveRuns(): ActiveAgentRun[] {
@@ -1487,6 +1859,17 @@ export class UserAgentObject {
     return crypto.randomUUID();
   }
 
+  private createTaskId() {
+    for (let attempts = 0; attempts < 5; attempts += 1) {
+      const bytes = new Uint8Array(4);
+      crypto.getRandomValues(bytes);
+      const id = `t_${[...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+      if (!this.getTask(id)) return id;
+    }
+
+    return `t_${crypto.randomUUID().slice(0, 8)}`;
+  }
+
   private createToolContext(): ToolContext {
     return {
       fetch: (input, init) => fetch(input, init),
@@ -1528,6 +1911,20 @@ function rowToApproval(row: PendingApprovalRow): PendingToolApproval {
     risk: row.risk,
     created_at: row.created_at,
     expires_at: row.expires_at,
+  };
+}
+
+function rowToTask(row: TaskRow): StoredTask {
+  return {
+    id: row.id,
+    channel: row.channel,
+    chatId: row.chat_id,
+    title: row.title,
+    status: row.status,
+    due_at: row.due_at,
+    created_at: row.created_at,
+    completed_at: row.completed_at,
+    notified_at: row.notified_at,
   };
 }
 

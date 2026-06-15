@@ -31,6 +31,15 @@ const TestControlRequestSchema = z.object({
   chatId: z.string().trim().min(1).max(128).optional().default(TEST_CHANNEL_DEFAULT_CHAT_ID),
 });
 
+const TestMemoryRequestSchema = z.object({
+  content: z.string().trim().min(1).max(1_200),
+});
+
+const TestTaskRequestSchema = TestControlRequestSchema.extend({
+  title: z.string().trim().min(1).max(1_200),
+  dueAt: z.number().int().positive().optional(),
+});
+
 const TestApprovalRequestSchema = TestControlRequestSchema.extend({
   llm: LlmConfigSchema.optional(),
   format: responseFormatSchema,
@@ -85,6 +94,12 @@ async function routeTestChannelRequest(request: Request, env: Env) {
         "POST /api/test-channel/stop",
         "GET /api/test-channel/approvals?chatId=default",
         "GET /api/test-channel/state",
+        "POST /api/test-channel/memories",
+        "DELETE /api/test-channel/memories/:id",
+        "GET /api/test-channel/tasks?chatId=default",
+        "POST /api/test-channel/tasks",
+        "POST /api/test-channel/tasks/:id/done",
+        "DELETE /api/test-channel/tasks/:id",
         "GET|PUT|DELETE /api/test-channel/llm",
         "POST /api/test-channel/llm/active",
         "POST /api/test-channel/llm/test",
@@ -123,6 +138,66 @@ async function routeTestChannelRequest(request: Request, env: Env) {
 
   if (request.method === "GET" && url.pathname.endsWith("/state")) {
     return fetchAgentObject(env, request.url, "/state", { method: "GET" });
+  }
+
+  if (request.method === "POST" && url.pathname.endsWith("/memories")) {
+    return handleTestCreateMemory(request, env);
+  }
+
+  const memoryMatch = /\/memories\/([^/]+)$/.exec(url.pathname);
+  if (request.method === "DELETE" && memoryMatch) {
+    return fetchAgentObject(
+      env,
+      request.url,
+      `/memories/${encodeURIComponent(decodeURIComponent(memoryMatch[1]))}`,
+      { method: "DELETE" },
+    );
+  }
+
+  if (request.method === "GET" && url.pathname.endsWith("/tasks")) {
+    const chatId = url.searchParams.get("chatId")?.trim() || TEST_CHANNEL_DEFAULT_CHAT_ID;
+    const status = url.searchParams.get("status")?.trim();
+    const params = new URLSearchParams({ channel: TEST_CHANNEL_NAME, chatId });
+    if (status) params.set("status", status);
+    return fetchAgentObject(env, request.url, `/tasks?${params.toString()}`, { method: "GET" });
+  }
+
+  if (request.method === "POST" && url.pathname.endsWith("/tasks")) {
+    return handleTestCreateTask(request, env);
+  }
+
+  const taskDoneMatch = /\/tasks\/([^/]+)\/done$/.exec(url.pathname);
+  if (request.method === "POST" && taskDoneMatch) {
+    const payload = await parseJsonBody(request, TestControlRequestSchema);
+    return fetchAgentObject(
+      env,
+      request.url,
+      `/tasks/${encodeURIComponent(decodeURIComponent(taskDoneMatch[1]))}/done`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: { channel: TEST_CHANNEL_NAME, chatId: payload.chatId },
+        }),
+      },
+    );
+  }
+
+  const taskMatch = /\/tasks\/([^/]+)$/.exec(url.pathname);
+  if (request.method === "DELETE" && taskMatch) {
+    const chatId = url.searchParams.get("chatId")?.trim() || TEST_CHANNEL_DEFAULT_CHAT_ID;
+    return fetchAgentObject(
+      env,
+      request.url,
+      `/tasks/${encodeURIComponent(decodeURIComponent(taskMatch[1]))}`,
+      {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: { channel: TEST_CHANNEL_NAME, chatId },
+        }),
+      },
+    );
   }
 
   if (
@@ -207,6 +282,28 @@ async function handleTestStop(request: Request, env: Env) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       source: { channel: TEST_CHANNEL_NAME, chatId: payload.chatId },
+    }),
+  });
+}
+
+async function handleTestCreateMemory(request: Request, env: Env) {
+  const payload = await parseJsonBody(request, TestMemoryRequestSchema);
+  return fetchAgentObject(env, request.url, "/memories", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+async function handleTestCreateTask(request: Request, env: Env) {
+  const payload = await parseJsonBody(request, TestTaskRequestSchema);
+  return fetchAgentObject(env, request.url, "/tasks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      source: { channel: TEST_CHANNEL_NAME, chatId: payload.chatId },
+      title: payload.title,
+      ...(payload.dueAt ? { dueAt: payload.dueAt } : {}),
     }),
   });
 }

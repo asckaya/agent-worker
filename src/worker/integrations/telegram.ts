@@ -6,6 +6,7 @@ export {
   isTelegramSecretValid,
   parseAllowedChatIds,
   parseTelegramAdminUserIds,
+  parseTelegramReminderArgs,
   resolveTelegramStreamMode,
   resolveTelegramStreamTransport,
   resolveTelegramTextBatchDelayMs,

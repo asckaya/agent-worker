@@ -2,17 +2,17 @@
 
 Cloudflare Worker personal agent focused on non-coding workflows. The MVP uses Cloudflare Workers, Durable Objects SQLite, Hono, React status page, Vercel AI SDK, zod, and server-side OpenAI-compatible LLM credentials for Telegram.
 
-The runtime is split into `model / tool / channel` layers. Telegram is the first real channel and supports slash commands, private-chat draft streaming with edit-message fallback, typing refresh, short text batching, interruptible active-run follow-up queueing, MarkdownV2 final-message fallback, and `/approve` tool approval with inline buttons. A protected HTTP test channel is also available for local/manual testing without Telegram.
+The runtime is split into `model / tool / channel` layers. Telegram is the first real channel and supports slash commands, inline menu buttons, private-chat draft streaming with edit-message fallback, typing refresh, short text batching, text-file handling, reminders/tasks, interruptible active-run follow-up queueing, MarkdownV2 final-message fallback, and `/approve` tool approval with inline buttons. A protected HTTP test channel is also available for local/manual testing without Telegram.
 
 ## Data Boundary
 
 - The web surface is status-only, not a chat client.
 - Telegram messages are used for the current turn and are not stored as conversation history.
-- Durable Object SQLite stores bounded `memories`, short-lived pending tool approvals, and bounded non-secret LLM profile overrides.
+- Durable Object SQLite stores bounded `memories`, bounded reminders/tasks, short-lived pending tool approvals, and bounded non-secret LLM profile overrides.
 - Active Telegram run state, approval continuation runs, paused approval sessions, and queued follow-up messages are kept in Durable Object memory only; they are not persisted as chat history.
 - Telegram uses server-side LLM secrets/env vars because it has no browser-local key store.
 - LLM API keys are Worker secrets/env bindings only; they are not stored in Durable Object SQLite, docs, or client state.
-- Memory is capped at 200 items and 1200 characters per item.
+- Memory is capped at 200 items and 1200 characters per item. Tasks are capped at 200 items.
 
 ## Tooling
 
@@ -36,15 +36,22 @@ Telegram uses separate protection:
 
 - `TELEGRAM_SECRET_TOKEN` validates Telegram webhook requests through the `X-Telegram-Bot-Api-Secret-Token` header.
 - `TELEGRAM_ALLOWED_CHAT_IDS` limits who can use the bot.
-- `TELEGRAM_ADMIN_USER_IDS` optionally limits mutating commands (`/approve`, `/deny`, `/forget`, `/stop`, `/new`, `/reset`, `/llmuse`) to specific Telegram users.
+- `TELEGRAM_ADMIN_USER_IDS` optionally limits mutating commands (`/approve`, `/deny`, `/forget`, `/remember`, `/stop`, `/new`, `/reset`, `/llmuse`, `/remind`, `/task`, `/todo`, `/done`) to specific Telegram users.
 - `TELEGRAM_STREAM_TRANSPORT` optionally controls streaming: `auto` default, `draft`, `edit`, or `off`.
 - `TELEGRAM_TEXT_BATCH_MS` optionally controls short incoming text debounce; default is `180`, max is `1000`, `0` disables batching.
+- `TELEGRAM_TIME_ZONE` optionally controls reminder time parsing/display; default is `Asia/Shanghai`.
 - `/id` in Telegram replies with the current chat id so you can add it to the allowlist.
 
 Telegram commands:
 
 - `/status`
+- `/menu`
 - `/memory`
+- `/remember <text>`
+- `/task <text>`
+- `/remind <when> <text>`
+- `/tasks`
+- `/done <task_id>`
 - `/llm`
 - `/llmuse <profile_id>`
 - `/llmtest`
@@ -82,6 +89,7 @@ TELEGRAM_ALLOWED_CHAT_IDS=123456789,-1001234567890
 TELEGRAM_ADMIN_USER_IDS=123456789
 TELEGRAM_STREAM_TRANSPORT=auto
 TELEGRAM_TEXT_BATCH_MS=180
+TELEGRAM_TIME_ZONE=Asia/Shanghai
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_API_KEY=...
 LLM_MODEL=gpt-4.1-mini
@@ -111,6 +119,29 @@ For one model, `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL` are enough. For mu
 
 `apiKeyEnv` is the Worker secret/env binding name to read at runtime. Do not put the actual API key in the profile JSON. Secret-bearing headers such as `Authorization` and `X-API-Key` are rejected in `extraHeaders`; use `apiKeyEnv` instead.
 
+For Cloudflare AI Gateway, either set `baseUrl` directly to the Gateway provider endpoint, or use first-class `aiGateway` metadata:
+
+```json
+{
+  "activeProfileId": "openrouter-gateway",
+  "profiles": [
+    {
+      "id": "openrouter-gateway",
+      "name": "OpenRouter via AI Gateway",
+      "aiGateway": {
+        "accountId": "YOUR_ACCOUNT_ID",
+        "gatewayId": "YOUR_GATEWAY_NAME",
+        "provider": "openrouter"
+      },
+      "model": "openai/gpt-5-mini",
+      "apiKeyEnv": "OPENROUTER_API_KEY"
+    }
+  ]
+}
+```
+
+This resolves to `https://gateway.ai.cloudflare.com/v1/YOUR_ACCOUNT_ID/YOUR_GATEWAY_NAME/openrouter`.
+
 Register the webhook:
 
 ```bash
@@ -136,7 +167,7 @@ wrangler secret put LLM_API_KEY
 wrangler secret put OPENROUTER_API_KEY
 ```
 
-User-specific runtime settings such as `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_ADMIN_USER_IDS`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_TEMPERATURE`, `LLM_MAX_TOKENS`, and `LLM_PROFILES_JSON` can be set in the Cloudflare Dashboard under Worker variables and secrets. `wrangler.jsonc` sets `keep_vars: true` so Git/CLI deploys preserve Dashboard-managed runtime configuration instead of deleting it.
+User-specific runtime settings such as `TELEGRAM_ALLOWED_CHAT_IDS`, `TELEGRAM_ADMIN_USER_IDS`, `TELEGRAM_TIME_ZONE`, `LLM_BASE_URL`, `LLM_MODEL`, `LLM_TEMPERATURE`, `LLM_MAX_TOKENS`, and `LLM_PROFILES_JSON` can be set in the Cloudflare Dashboard under Worker variables and secrets. `wrangler.jsonc` sets `keep_vars: true` so Git/CLI deploys preserve Dashboard-managed runtime configuration instead of deleting it.
 
 Wrangler local dev reads `.dev.vars`; use that instead of `.env` for local Worker secrets. For production, use Worker secrets for sensitive values and plain variables only for non-secret allowlists/profile metadata.
 
@@ -167,6 +198,12 @@ Approval and control endpoints:
 - `POST /api/test-channel/stop`
 - `GET /api/test-channel/approvals?chatId=local`
 - `GET /api/test-channel/state`
+- `POST /api/test-channel/memories`
+- `DELETE /api/test-channel/memories/<id>`
+- `GET /api/test-channel/tasks?chatId=local`
+- `POST /api/test-channel/tasks`
+- `POST /api/test-channel/tasks/<id>/done`
+- `DELETE /api/test-channel/tasks/<id>`
 - `GET|PUT|DELETE /api/test-channel/llm`
 - `POST /api/test-channel/llm/active`
 - `POST /api/test-channel/llm/test`
@@ -211,7 +248,7 @@ bun run telegram:set-commands
 
 `bun run build` runs typecheck and builds the status-page assets, which is the right command for Cloudflare Git builds. `bun run deploy:dry-run` additionally runs the Wrangler dry-run build and writes Wrangler config/log state under `.wrangler-home` inside the project. `bun run test:coverage` runs the Vitest suite with V8 coverage and writes HTML/lcov reports under `coverage/`. `bun run test:full` runs tests plus the Wrangler dry-run build.
 
-Current tests cover zod validation schemas, cookies, top-level Worker route/auth/assets boundaries, Cloudflare runtime-boundary checks, context assembly, memory search helpers, zod-backed basic/research/GitHub/web/memory tools, tool registry/executor/guardrails, Durable Object approval/follow-up state, HTTP test channel proxying, channel command/SSE/registry helpers, OpenAI-compatible AI SDK streaming/tool calls, Telegram webhook auth paths, Telegram draft streaming, text batching, edit fallback and flood-control fallback, MarkdownV2 plain fallback, stale preview cleanup, inline approval callbacks, active-run stop commands, and command admin policy.
+Current tests cover zod validation schemas, cookies, top-level Worker route/auth/assets boundaries, Cloudflare runtime-boundary checks, context assembly, memory search helpers, zod-backed basic/research/GitHub/web/memory tools, tool registry/executor/guardrails, Durable Object approval/follow-up/task state, HTTP test channel proxying, channel command/SSE/registry helpers, OpenAI-compatible AI SDK streaming/tool calls, Telegram webhook auth paths, Telegram draft streaming, text batching, edit fallback and flood-control fallback, MarkdownV2 plain fallback, stale preview cleanup, inline approval callbacks/menu actions, active-run stop commands, and command admin policy.
 
 ## Docs
 

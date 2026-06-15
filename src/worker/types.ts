@@ -9,6 +9,7 @@ export interface Env {
   TELEGRAM_ADMIN_USER_IDS?: string;
   TELEGRAM_STREAM_TRANSPORT?: string;
   TELEGRAM_TEXT_BATCH_MS?: string;
+  TELEGRAM_TIME_ZONE?: string;
   LLM_BASE_URL?: string;
   LLM_API_KEY?: string;
   LLM_MODEL?: string;
@@ -62,6 +63,18 @@ export interface StoredMemory {
   id: string;
   content: string;
   created_at: number;
+}
+
+export interface StoredTask {
+  id: string;
+  channel: string;
+  chatId: string;
+  title: string;
+  status: "pending" | "done";
+  due_at: number | null;
+  created_at: number;
+  completed_at: number | null;
+  notified_at: number | null;
 }
 
 export interface ChannelSource {

@@ -17,6 +17,12 @@ const SECRET_HEADER_NAMES = new Set([
 const profileId = z.string().trim().min(1).max(40).regex(/^[a-zA-Z0-9_-]+$/);
 const envBindingName = z.string().trim().min(1).max(64).regex(/^[A-Z][A-Z0-9_]*$/);
 const nonEmptyString = z.string().trim().min(1);
+const aiGatewayPathPart = z
+  .string()
+  .trim()
+  .min(1)
+  .max(100)
+  .regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/);
 const ExtraHeadersSchema = z
   .record(z.string().trim().min(1).max(128), z.string().max(1_000))
   .superRefine((headers, ctx) => {
@@ -30,20 +36,36 @@ const ExtraHeadersSchema = z
     }
   });
 
-export const LlmProfileSchema = z.object({
-  id: profileId,
-  name: z.string().trim().min(1).max(80).optional(),
-  baseUrl: z.string().trim().url(),
-  model: nonEmptyString.max(200),
-  apiKeyEnv: envBindingName.optional().default(DEFAULT_LLM_API_KEY_ENV),
-  temperature: z.number().min(0).max(2).optional(),
-  maxTokens: z.number().int().positive().max(128_000).optional(),
-  extraHeaders: ExtraHeadersSchema
-    .optional()
-    .transform((headers) =>
-      headers ? Object.fromEntries(Object.entries(headers).slice(0, MAX_EXTRA_HEADERS)) : undefined,
-    ),
+export const AiGatewayProfileSchema = z.object({
+  accountId: z.string().trim().min(1).max(100),
+  gatewayId: aiGatewayPathPart,
+  provider: aiGatewayPathPart,
 });
+
+export const LlmProfileSchema = z
+  .object({
+    id: profileId,
+    name: z.string().trim().min(1).max(80).optional(),
+    baseUrl: z.string().trim().url().optional(),
+    aiGateway: AiGatewayProfileSchema.optional(),
+    model: nonEmptyString.max(200),
+    apiKeyEnv: envBindingName.optional().default(DEFAULT_LLM_API_KEY_ENV),
+    temperature: z.number().min(0).max(2).optional(),
+    maxTokens: z.number().int().positive().max(128_000).optional(),
+    extraHeaders: ExtraHeadersSchema
+      .optional()
+      .transform((headers) =>
+        headers ? Object.fromEntries(Object.entries(headers).slice(0, MAX_EXTRA_HEADERS)) : undefined,
+      ),
+  })
+  .superRefine((profile, ctx) => {
+    if (profile.baseUrl || profile.aiGateway) return;
+    ctx.addIssue({
+      code: "custom",
+      message: "baseUrl or aiGateway is required.",
+      path: ["baseUrl"],
+    });
+  });
 
 export const LlmSettingsSchema = z
   .object({
@@ -141,7 +163,7 @@ export function resolveLlmConfigFromSettings(settings: LlmSettings, env: Env): L
   }
 
   return {
-    baseUrl: profile.baseUrl,
+    baseUrl: resolveLlmProfileBaseUrl(profile),
     apiKey,
     model: profile.model,
     temperature: profile.temperature,
@@ -155,9 +177,26 @@ export function summarizeLlmSettings(settings: LlmSettings, env: Env) {
     activeProfileId: settings.activeProfileId,
     profiles: settings.profiles.map((profile) => ({
       ...profile,
+      baseUrl: resolveLlmProfileBaseUrl(profile),
       hasApiKey: Boolean(readEnvString(env, profile.apiKeyEnv)),
     })),
   };
+}
+
+export function resolveLlmProfileBaseUrl(profile: Pick<LlmProfile, "baseUrl" | "aiGateway">) {
+  if (profile.baseUrl) return profile.baseUrl;
+  if (!profile.aiGateway) {
+    throw new Error("LLM profile requires baseUrl or aiGateway.");
+  }
+  return buildAiGatewayBaseUrl(profile.aiGateway);
+}
+
+export function buildAiGatewayBaseUrl(gateway: {
+  accountId: string;
+  gatewayId: string;
+  provider: string;
+}) {
+  return `https://gateway.ai.cloudflare.com/v1/${gateway.accountId}/${gateway.gatewayId}/${gateway.provider}`;
 }
 
 function readEnvString(env: Env, key: string) {

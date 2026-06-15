@@ -7,6 +7,7 @@ import {
   isTelegramSecretValid,
   parseAllowedChatIds,
   parseTelegramAdminUserIds,
+  parseTelegramReminderArgs,
   resolveTelegramStreamMode,
   resolveTelegramStreamTransport,
   resolveTelegramTextBatchDelayMs,
@@ -469,6 +470,184 @@ describe("telegram integration", () => {
         }),
       }),
     );
+  });
+
+  it("renders an inline Telegram menu", async () => {
+    const telegramFetch = vi.fn(async () =>
+      Response.json({ ok: true, result: { message_id: 42 } }),
+    );
+    vi.stubGlobal("fetch", telegramFetch);
+
+    await handleTelegramWebhook(
+      webhookRequest({
+        message: {
+          message_id: 16,
+          text: "/menu",
+          chat: { id: 123, type: "private" },
+        },
+      }),
+      env({
+        TELEGRAM_SECRET_TOKEN: "secret",
+        TELEGRAM_BOT_TOKEN: "bot-token",
+        TELEGRAM_ALLOWED_CHAT_IDS: "123",
+      }),
+    );
+
+    expect(telegramFetch).toHaveBeenCalledWith(
+      "https://api.telegram.org/botbot-token/sendMessage",
+      expect.objectContaining({
+        body: JSON.stringify({
+          chat_id: "123",
+          text: "Agent menu",
+          reply_to_message_id: 16,
+          allow_sending_without_reply: true,
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: "Status", callback_data: "agent-worker:menu:status" },
+                { text: "LLM", callback_data: "agent-worker:menu:llm" },
+              ],
+              [
+                { text: "Memory", callback_data: "agent-worker:menu:memory" },
+                { text: "Tasks", callback_data: "agent-worker:menu:tasks" },
+              ],
+              [
+                { text: "Pending", callback_data: "agent-worker:menu:pending" },
+                { text: "Stop", callback_data: "agent-worker:menu:stop" },
+              ],
+            ],
+          },
+        }),
+      }),
+    );
+  });
+
+  it("creates Telegram reminders through the task endpoint", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-15T10:00:00Z"));
+    const telegramFetch = vi.fn(async () =>
+      Response.json({ ok: true, result: { message_id: 42 } }),
+    );
+    vi.stubGlobal("fetch", telegramFetch);
+
+    let agentPath = "";
+    let agentRequestBody: unknown;
+    const agentFetch = vi.fn(async (request: Request) => {
+      agentPath = new URL(request.url).pathname;
+      agentRequestBody = await request.json();
+      return Response.json({
+        ok: true,
+        task: {
+          id: "t_123",
+          due_at: Date.now() + 600_000,
+        },
+      });
+    });
+
+    await handleTelegramWebhook(
+      webhookRequest({
+        message: {
+          message_id: 17,
+          text: "/remind 10m drink water",
+          chat: { id: 123, type: "private" },
+          from: { id: 42 },
+        },
+      }),
+      env({
+        TELEGRAM_SECRET_TOKEN: "secret",
+        TELEGRAM_BOT_TOKEN: "bot-token",
+        TELEGRAM_ALLOWED_CHAT_IDS: "123",
+        TELEGRAM_ADMIN_USER_IDS: "42",
+        AGENT_OBJECT: agentNamespace(agentFetch),
+      }),
+    );
+
+    expect(agentPath).toBe("/tasks");
+    expect(agentRequestBody).toEqual({
+      source: { channel: "telegram", chatId: "123" },
+      title: "drink water",
+      dueAt: Date.now() + 600_000,
+    });
+    expect(telegramFetch).toHaveBeenCalledWith(
+      "https://api.telegram.org/botbot-token/sendMessage",
+      expect.objectContaining({
+        body: expect.stringContaining("Reminder added: t_123"),
+      }),
+    );
+  });
+
+  it("parses common Telegram reminder times", () => {
+    const now = Date.parse("2026-06-15T10:00:00Z");
+
+    expect(parseTelegramReminderArgs("10m stretch", now)).toEqual({
+      dueAt: now + 600_000,
+      title: "stretch",
+    });
+    expect(parseTelegramReminderArgs("2小时后 喝水", now)).toEqual({
+      dueAt: now + 2 * 60 * 60_000,
+      title: "喝水",
+    });
+    expect(parseTelegramReminderArgs("bad", now)).toBeInstanceOf(Error);
+  });
+
+  it("passes supported Telegram text files to the agent without storing them", async () => {
+    const telegramFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith("/getFile")) {
+        return Response.json({ ok: true, result: { file_path: "docs/note.txt", file_size: 18 } });
+      }
+      if (url === "https://api.telegram.org/file/botbot-token/docs/note.txt") {
+        return new Response("hello from a file", {
+          headers: { "Content-Type": "text/plain", "Content-Length": "17" },
+        });
+      }
+      return Response.json({ ok: true, result: { message_id: 42 } });
+    });
+    vi.stubGlobal("fetch", telegramFetch);
+
+    let agentRequestBody: unknown;
+    const agentFetch = vi.fn(async (request: Request) => {
+      agentRequestBody = await request.json();
+      return new Response(sseStream([["done", { content: "File summary" }]]), {
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    });
+
+    await handleTelegramWebhook(
+      webhookRequest({
+        message: {
+          message_id: 18,
+          caption: "summarize",
+          document: {
+            file_id: "file-1",
+            file_name: "note.txt",
+            mime_type: "text/plain",
+            file_size: 18,
+          },
+          chat: { id: 123, type: "private" },
+        },
+      }),
+      env({
+        TELEGRAM_SECRET_TOKEN: "secret",
+        TELEGRAM_BOT_TOKEN: "bot-token",
+        TELEGRAM_ALLOWED_CHAT_IDS: "123",
+        LLM_BASE_URL: "https://api.openai.com/v1",
+        LLM_API_KEY: "key",
+        LLM_MODEL: "gpt-test",
+        AGENT_OBJECT: agentNamespace(agentFetch),
+      }),
+    );
+
+    expect(agentRequestBody).toMatchObject({
+      source: { channel: "telegram", chatId: "123" },
+      llm: {
+        baseUrl: "https://api.openai.com/v1",
+        apiKey: "key",
+        model: "gpt-test",
+      },
+    });
+    expect((agentRequestBody as { message: string }).message).toContain("User instruction: summarize");
+    expect((agentRequestBody as { message: string }).message).toContain("hello from a file");
   });
 
   it("falls back to edit-message streaming when Telegram drafts fail", async () => {

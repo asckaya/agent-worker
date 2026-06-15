@@ -115,6 +115,62 @@ describe("test channel", () => {
     });
   });
 
+  it("proxies memory and task management endpoints", async () => {
+    const calls: Array<{ path: string; body?: unknown; method: string }> = [];
+    const agentFetch = vi.fn(async (request: Request) => {
+      const path = new URL(request.url).pathname;
+      calls.push({
+        path,
+        method: request.method,
+        body: request.method === "GET" || request.method === "DELETE"
+          ? undefined
+          : await request.json(),
+      });
+      return Response.json({ ok: true, task: { id: "t_1" }, memory: { id: "m_1" } });
+    });
+
+    await handleTestChannelRequest(
+      jsonRequest("/api/test-channel/memories", { content: "remember this" }),
+      env({ AGENT_OBJECT: agentNamespace(agentFetch) }),
+    );
+    await handleTestChannelRequest(
+      jsonRequest("/api/test-channel/tasks", {
+        chatId: "local",
+        title: "pay bill",
+        dueAt: 1_900_000_000_000,
+      }),
+      env({ AGENT_OBJECT: agentNamespace(agentFetch) }),
+    );
+    await handleTestChannelRequest(
+      jsonRequest("/api/test-channel/tasks/t_1/done", { chatId: "local" }),
+      env({ AGENT_OBJECT: agentNamespace(agentFetch) }),
+    );
+
+    expect(calls).toEqual([
+      {
+        path: "/memories",
+        method: "POST",
+        body: { content: "remember this" },
+      },
+      {
+        path: "/tasks",
+        method: "POST",
+        body: {
+          source: { channel: "test", chatId: "local" },
+          title: "pay bill",
+          dueAt: 1_900_000_000_000,
+        },
+      },
+      {
+        path: "/tasks/t_1/done",
+        method: "POST",
+        body: {
+          source: { channel: "test", chatId: "local" },
+        },
+      },
+    ]);
+  });
+
   it("requires LLM config for chat when env is not configured", async () => {
     const agentFetch = vi.fn(async (request: Request) => {
       if (new URL(request.url).pathname === "/settings/llm") {

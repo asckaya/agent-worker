@@ -4,6 +4,7 @@ import type { ChannelSource, ChatRequest, LlmConfig } from "./types";
 const MAX_MESSAGE_CHARS = 16_000;
 const MAX_HISTORY_MESSAGES = 24;
 const MAX_EXTRA_HEADERS = 10;
+const MAX_TASK_TITLE_CHARS = 1_200;
 
 const nonEmptyString = z.string().trim().min(1);
 
@@ -56,6 +57,16 @@ export const SessionControlRequestSchema = z.object({
   source: ChannelSourceSchema.optional(),
 });
 
+export const TaskCreateRequestSchema = z.object({
+  source: ChannelSourceSchema,
+  title: nonEmptyString.transform((title) => title.slice(0, MAX_TASK_TITLE_CHARS)),
+  dueAt: z.number().int().positive().optional(),
+});
+
+export const TaskActionRequestSchema = z.object({
+  source: ChannelSourceSchema.optional(),
+});
+
 const TelegramUserSchema = z
   .object({
     id: z.number().int(),
@@ -64,10 +75,22 @@ const TelegramUserSchema = z
   })
   .optional();
 
+const TelegramDocumentSchema = z
+  .object({
+    file_id: z.string().min(1),
+    file_name: z.string().optional(),
+    mime_type: z.string().optional(),
+    file_size: z.number().int().nonnegative().optional(),
+  })
+  .passthrough()
+  .optional();
+
 const TelegramMessageSchema = z
   .object({
     message_id: z.number().int(),
     text: z.string().optional(),
+    caption: z.string().optional(),
+    document: TelegramDocumentSchema,
     chat: z.object({
       id: z.union([z.number().int(), z.string()]).transform(String),
       type: z.string(),
@@ -124,6 +147,28 @@ export function parseSessionControlPayload(payload: unknown): {
   const result = SessionControlRequestSchema.safeParse(payload);
   if (!result.success) {
     throw new Error(formatZodError("Invalid session control request", result.error));
+  }
+  return result.data;
+}
+
+export function parseTaskCreatePayload(payload: unknown): {
+  source: ChannelSource;
+  title: string;
+  dueAt?: number;
+} {
+  const result = TaskCreateRequestSchema.safeParse(payload);
+  if (!result.success) {
+    throw new Error(formatZodError("Invalid task request", result.error));
+  }
+  return result.data;
+}
+
+export function parseTaskActionPayload(payload: unknown): {
+  source?: ChannelSource;
+} {
+  const result = TaskActionRequestSchema.safeParse(payload);
+  if (!result.success) {
+    throw new Error(formatZodError("Invalid task action request", result.error));
   }
   return result.data;
 }
