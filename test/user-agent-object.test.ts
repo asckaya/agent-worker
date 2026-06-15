@@ -280,6 +280,32 @@ describe("UserAgentObject run state", () => {
     expect(sql.runtimeSettings[0]?.value_json).not.toContain("secret-key");
   });
 
+  it("curates memory with the model before saving", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql);
+    vi.stubGlobal(
+      "fetch",
+      createFetchMock([openAiTextResponse("用户偏好：以后回答先给结论，再给必要步骤。")]),
+    );
+
+    const response = await object.fetch(
+      jsonRequest("/memories/curate", {
+        content: "你记一下，我比较喜欢先看结论，然后再看步骤，不要一上来讲太多背景。",
+        llm: llmConfig(),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      ok: true,
+      memory: {
+        content: "用户偏好：以后回答先给结论，再给必要步骤。",
+      },
+    });
+    expect(sql.memories).toHaveLength(1);
+    expect(sql.memories[0]?.content).not.toContain("你记一下");
+  });
+
   it("rejects secret-bearing LLM extra headers", async () => {
     const sql = new FakeSqlStorage();
     const object = createObject(sql);

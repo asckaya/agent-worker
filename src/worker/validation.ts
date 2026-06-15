@@ -5,6 +5,7 @@ const MAX_MESSAGE_CHARS = 16_000;
 const MAX_HISTORY_MESSAGES = 24;
 const MAX_EXTRA_HEADERS = 10;
 const MAX_TASK_TITLE_CHARS = 1_200;
+const MAX_MEMORY_INPUT_CHARS = 16_000;
 const MAX_CHAT_ATTACHMENTS = 4;
 const MAX_ATTACHMENT_DATA_CHARS = 8 * 1024 * 1024;
 
@@ -81,6 +82,11 @@ export const ApprovalActionRequestSchema = z.object({
 
 export const SessionControlRequestSchema = z.object({
   source: ChannelSourceSchema.optional(),
+});
+
+export const MemoryCreateRequestSchema = z.object({
+  content: nonEmptyString.transform((content) => content.slice(0, MAX_MEMORY_INPUT_CHARS)),
+  llm: LlmConfigSchema.optional(),
 });
 
 export const TaskCreateRequestSchema = z.object({
@@ -198,6 +204,17 @@ export function parseSessionControlPayload(payload: unknown): {
   const result = SessionControlRequestSchema.safeParse(payload);
   if (!result.success) {
     throw new Error(formatZodError("Invalid session control request", result.error));
+  }
+  return result.data;
+}
+
+export function parseMemoryCreatePayload(payload: unknown): {
+  content: string;
+  llm?: LlmConfig;
+} {
+  const result = MemoryCreateRequestSchema.safeParse(payload);
+  if (!result.success) {
+    throw new Error(formatZodError("Invalid memory request", result.error));
   }
   return result.data;
 }

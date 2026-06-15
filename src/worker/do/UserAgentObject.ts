@@ -41,6 +41,7 @@ import type {
 import {
   parseApprovalActionPayload,
   parseChatRequestPayload,
+  parseMemoryCreatePayload,
   parseSessionControlPayload,
   parseTaskActionPayload,
   parseTaskCreatePayload,
@@ -165,6 +166,10 @@ export class UserAgentObject {
 
     if (request.method === "POST" && url.pathname === "/memories") {
       return this.handleCreateMemory(request);
+    }
+
+    if (request.method === "POST" && url.pathname === "/memories/curate") {
+      return this.handleCreateCuratedMemory(request);
     }
 
     if (request.method === "GET" && url.pathname === "/tasks") {
@@ -302,13 +307,31 @@ export class UserAgentObject {
   }
 
   private async handleCreateMemory(request: Request) {
-    const body = (await request.json().catch(() => ({}))) as { content?: unknown };
-    if (typeof body.content !== "string" || !body.content.trim()) {
-      return Response.json({ error: "Memory content is required." }, { status: 400 });
+    try {
+      const payload = parseMemoryCreatePayload(await request.json().catch(() => ({})));
+      const memory = this.saveMemory(payload.content);
+      return Response.json({ ok: true, memory, memories: this.getMemories() });
+    } catch (error) {
+      return errorResponse(error);
     }
+  }
 
-    const memory = this.saveMemory(body.content);
-    return Response.json({ ok: true, memory, memories: this.getMemories() });
+  private async handleCreateCuratedMemory(request: Request) {
+    try {
+      const payload = parseMemoryCreatePayload(await request.json().catch(() => ({})));
+      if (!payload.llm) {
+        throw new HttpError("LLM config is required to curate memory.", 400);
+      }
+      const curated = await this.curateMemory(payload.content, payload.llm);
+      const memory = this.saveMemory(curated);
+      return Response.json({
+        ok: true,
+        memory,
+        memories: this.getMemories(),
+      });
+    } catch (error) {
+      return errorResponse(error);
+    }
   }
 
   private async handleCreateTask(request: Request) {
@@ -1778,6 +1801,36 @@ export class UserAgentObject {
     });
 
     return response.content.trim() || formatApprovedToolResult(approval, toolResult);
+  }
+
+  private async curateMemory(content: string, llm: LlmConfig) {
+    const response = await streamChatCompletion({
+      config: llm,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "You curate durable memory for a personal assistant.",
+            "Rewrite the user's note into one concise memory item that will be useful in future conversations.",
+            "Keep stable preferences, personal facts, project context, and recurring instructions.",
+            "Do not store transient chat wording, task reminders, secrets, API keys, passwords, or raw credentials.",
+            "Do not invent details. Use the same language as the user's note when practical.",
+            "Return only the memory item, without bullets, labels, quotes, or explanation.",
+          ].join(" "),
+        },
+        {
+          role: "user",
+          content,
+        },
+      ],
+      onToken: async () => undefined,
+    });
+
+    const curated = response.content.trim().replace(/\s+/g, " ");
+    if (!curated) {
+      throw new HttpError("The model did not return a memory item.", 502);
+    }
+    return curated;
   }
 
   private getPendingApprovals(filter: { channel?: string; chatId?: string } = {}) {

@@ -576,6 +576,69 @@ describe("telegram integration", () => {
     );
   });
 
+  it("curates Telegram /remember notes through the agent object", async () => {
+    const telegramFetch = vi.fn(async () =>
+      Response.json({ ok: true, result: { message_id: 42 } }),
+    );
+    vi.stubGlobal("fetch", telegramFetch);
+
+    let agentPath = "";
+    let agentRequestBody: unknown;
+    const agentFetch = vi.fn(async (request: Request) => {
+      agentPath = new URL(request.url).pathname;
+      agentRequestBody = await request.json();
+      return Response.json({
+        ok: true,
+        memory: {
+          id: "mem_1",
+          content: "用户偏好：回答先给结论。",
+        },
+      });
+    });
+
+    await handleTelegramWebhook(
+      webhookRequest({
+        message: {
+          message_id: 18,
+          text: "/remember 我喜欢回答先给结论",
+          chat: { id: 123, type: "private" },
+          from: { id: 42 },
+        },
+      }),
+      env({
+        TELEGRAM_SECRET_TOKEN: "secret",
+        TELEGRAM_BOT_TOKEN: "bot-token",
+        TELEGRAM_ALLOWED_CHAT_IDS: "123",
+        TELEGRAM_ADMIN_USER_IDS: "42",
+        LLM_BASE_URL: "https://api.openai.com/v1",
+        LLM_API_KEY: "key",
+        LLM_MODEL: "gpt-test",
+        AGENT_OBJECT: agentNamespace(agentFetch),
+      }),
+    );
+
+    expect(agentPath).toBe("/memories/curate");
+    expect(agentRequestBody).toEqual({
+      content: "我喜欢回答先给结论",
+      llm: {
+        baseUrl: "https://api.openai.com/v1",
+        apiKey: "key",
+        model: "gpt-test",
+      },
+    });
+    expect(telegramFetch).toHaveBeenCalledWith(
+      "https://api.telegram.org/botbot-token/sendMessage",
+      expect.objectContaining({
+        body: JSON.stringify({
+          chat_id: "123",
+          text: "Saved memory: mem_1\n用户偏好：回答先给结论。",
+          reply_to_message_id: 18,
+          allow_sending_without_reply: true,
+        }),
+      }),
+    );
+  });
+
   it("parses common Telegram reminder times", () => {
     const now = Date.parse("2026-06-15T10:00:00Z");
 

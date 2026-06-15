@@ -4,7 +4,7 @@ const TELEGRAM_COMMANDS = [
   { command: "menu", description: "Show inline action menu" },
   { command: "status", description: "Show runtime status" },
   { command: "memory", description: "List saved memory" },
-  { command: "remember", description: "Save a memory" },
+  { command: "remember", description: "Curate and save a memory" },
   { command: "task", description: "Add a task" },
   { command: "remind", description: "Add a reminder" },
   { command: "tasks", description: "List pending tasks" },

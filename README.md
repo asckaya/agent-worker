@@ -14,6 +14,7 @@ The runtime is split into `model / tool / channel` layers. Telegram is the first
 - LLM API keys are Worker secrets/env bindings only; they are not stored in Durable Object SQLite, docs, or client state.
 - Memory is capped at 200 items and 1200 characters per item. Tasks are capped at 200 items.
 - Telegram media files are never persisted. Supported media is downloaded only for the current turn and sent to the active model as bounded request content.
+- Telegram `/remember` sends the note to the active LLM for curation and stores only the curated memory item, not the raw note.
 
 ## Tooling
 
@@ -48,7 +49,7 @@ Telegram commands:
 - `/status`
 - `/menu`
 - `/memory`
-- `/remember <text>`
+- `/remember <text>` - curate with the active model and save memory
 - `/task <text>`
 - `/remind <when> <text>`
 - `/tasks`

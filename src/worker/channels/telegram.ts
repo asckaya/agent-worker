@@ -649,7 +649,7 @@ function helpText() {
     "/menu - show inline action menu",
     "/status - show runtime status",
     "/memory - list saved memories",
-    "/remember <text> - save a memory",
+    "/remember <text> - curate and save a memory",
     "/task <text> - add a task",
     "/remind <when> <text> - add a reminder",
     "/tasks - list pending tasks",
@@ -779,10 +779,16 @@ async function handleRememberCommand(
     return;
   }
 
-  const response = await fetchAgentObject(env, requestUrl, "/memories", {
+  const llm = await resolveRequiredChannelLlm(env, requestUrl, undefined, "Telegram");
+  if (llm instanceof Error) {
+    await sendTelegramMessage(env, incoming.chatId, llm.message, incoming.messageId);
+    return;
+  }
+
+  const response = await fetchAgentObject(env, requestUrl, "/memories/curate", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content, llm }),
   });
   const body = (await response.json().catch(() => ({}))) as {
     memory?: StoredMemory;
@@ -795,7 +801,9 @@ async function handleRememberCommand(
   await sendTelegramMessage(
     env,
     incoming.chatId,
-    `Saved memory: ${body.memory?.id ?? "ok"}`,
+    [`Saved memory: ${body.memory?.id ?? "ok"}`, body.memory?.content ?? ""]
+      .filter(Boolean)
+      .join("\n"),
     incoming.messageId,
   );
 }
