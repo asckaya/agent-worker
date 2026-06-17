@@ -22,6 +22,39 @@ interface SkillSummary {
   files?: Array<{ path: string }>;
 }
 
+interface SkillSettings {
+  sources?: string[];
+  skills?: SkillSummary[];
+}
+
+interface McpStatusServer {
+  name: string;
+  url: string;
+  status: "connected" | "disabled" | "failed";
+  cached?: boolean;
+  transport?: string;
+  error?: string;
+  headerNames?: string[];
+  toolCount?: number;
+  promptCount?: number;
+  resourceCount?: number;
+  tools?: Array<{ name?: string; description?: string }>;
+  prompts?: Array<{ name?: string; description?: string }>;
+  resources?: Array<{ name?: string; uri?: string; description?: string; mimeType?: string }>;
+}
+
+interface RuntimeSettingsResponse {
+  settings?: {
+    skills?: SkillSettings;
+    mcp?: unknown;
+    permissions?: unknown;
+  };
+}
+
+interface McpStatusResponse {
+  servers?: McpStatusServer[];
+}
+
 const checks = [
   { label: "Runtime", value: "Cloudflare Workers", detail: "Hono API routes" },
   { label: "State", value: "Durable Object SQLite", detail: "Memory, sessions, approvals" },
@@ -56,10 +89,11 @@ function App() {
   });
   const [auth, setAuth] = useState<AuthState>({ checked: false, authenticated: false });
   const [token, setToken] = useState("");
-  const [skillMarkdown, setSkillMarkdown] = useState(DEFAULT_SKILL_TEMPLATE);
-  const [skillSource, setSkillSource] = useState("vercel-labs/agent-skills");
+  const [skillSources, setSkillSources] = useState<string[]>(["vercel-labs/agent-skills"]);
   const [skills, setSkills] = useState<SkillSummary[]>([]);
   const [mcpText, setMcpText] = useState('{\n  "servers": {}\n}');
+  const [mcpStatus, setMcpStatus] = useState<McpStatusServer[]>([]);
+  const [permissionText, setPermissionText] = useState('{\n  "rules": []\n}');
   const [configStatus, setConfigStatus] = useState("Not loaded");
 
   useEffect(() => {
@@ -129,12 +163,18 @@ function App() {
   async function loadConfig() {
     setConfigStatus("Loading...");
     try {
-      const [skills, mcp] = await Promise.all([
-        fetchJson<{ settings?: { skills?: SkillSummary[] } }>("/api/agent/settings/skills"),
-        fetchJson<{ settings: unknown }>("/api/agent/settings/mcp"),
+      const [runtime, mcp] = await Promise.all([
+        fetchJson<RuntimeSettingsResponse>("/api/agent/settings/runtime"),
+        fetchJson<McpStatusResponse>("/api/agent/settings/mcp/status").catch(() => ({ servers: [] })),
       ]);
-      setSkills(skills.settings?.skills ?? []);
-      setMcpText(JSON.stringify(mcp.settings ?? { servers: {} }, null, 2));
+      const skillSettings = runtime.settings?.skills ?? {};
+      setSkills(skillSettings.skills ?? []);
+      setSkillSources(normalizeSkillSources(skillSettings.sources ?? []).length
+        ? normalizeSkillSources(skillSettings.sources ?? [])
+        : [""]);
+      setMcpText(JSON.stringify(runtime.settings?.mcp ?? { servers: {} }, null, 2));
+      setPermissionText(JSON.stringify(runtime.settings?.permissions ?? { rules: [] }, null, 2));
+      setMcpStatus(mcp.servers ?? []);
       setConfigStatus("Loaded");
     } catch (error) {
       setConfigStatus(error instanceof Error ? error.message : "Load failed");
@@ -157,40 +197,119 @@ function App() {
     }
   }
 
-  async function importSkill() {
-    setConfigStatus("Importing skill...");
-    try {
-      const response = await fetchJson<{ settings?: { skills?: SkillSummary[] } }>(
-        "/api/agent/settings/skills/import",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ markdown: skillMarkdown }),
-        },
-      );
-      setSkills(response.settings?.skills ?? []);
-      setConfigStatus("Skill imported");
-    } catch (error) {
-      setConfigStatus(error instanceof Error ? error.message : "Import failed");
-    }
-  }
-
   async function importSkillSource() {
-    setConfigStatus("Importing skill source...");
+    const sources = normalizeSkillSources(skillSources);
+    if (sources.length === 0) {
+      setConfigStatus("Add at least one skill source");
+      return;
+    }
+
+    setConfigStatus(`Importing ${sources.length} skill source${sources.length === 1 ? "" : "s"}...`);
     try {
-      const response = await fetchJson<{ settings?: { skills?: SkillSummary[] } }>(
+      const response = await fetchJson<{ settings?: SkillSettings }>(
         "/api/agent/settings/skills/source",
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ source: skillSource }),
+          body: JSON.stringify({ sources }),
         },
       );
       setSkills(response.settings?.skills ?? []);
-      setConfigStatus("Skill source imported");
+      setSkillSources(response.settings?.sources?.length ? response.settings.sources : sources);
+      setConfigStatus("Skill sources imported");
     } catch (error) {
       setConfigStatus(error instanceof Error ? error.message : "Source import failed");
     }
+  }
+
+  async function saveSkillSources() {
+    const sources = normalizeSkillSources(skillSources);
+    setConfigStatus("Saving skill sources...");
+    try {
+      const response = await fetchJson<{ settings?: SkillSettings }>(
+        "/api/agent/settings/skills/sources",
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sources }),
+        },
+      );
+      setSkillSources(response.settings?.sources?.length ? response.settings.sources : [""]);
+      setConfigStatus("Skill sources saved");
+    } catch (error) {
+      setConfigStatus(error instanceof Error ? error.message : "Save sources failed");
+    }
+  }
+
+  async function reimportSkillSources() {
+    setConfigStatus("Reimporting saved skill sources...");
+    try {
+      const response = await fetchJson<{ settings?: SkillSettings }>(
+        "/api/agent/settings/skills/reimport",
+        { method: "POST" },
+      );
+      setSkills(response.settings?.skills ?? []);
+      setSkillSources(response.settings?.sources?.length ? response.settings.sources : [""]);
+      setConfigStatus("Saved skill sources reimported");
+    } catch (error) {
+      setConfigStatus(error instanceof Error ? error.message : "Reimport failed");
+    }
+  }
+
+  async function refreshMcpStatus() {
+    setConfigStatus("Testing MCP servers...");
+    try {
+      const response = await fetchJson<McpStatusResponse>(
+        "/api/agent/settings/mcp/refresh",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        },
+      );
+      setMcpStatus(response.servers ?? []);
+      setConfigStatus("MCP status refreshed");
+    } catch (error) {
+      setConfigStatus(error instanceof Error ? error.message : "MCP test failed");
+    }
+  }
+
+  function updateSkillSource(index: number, value: string) {
+    setSkillSources((current) =>
+      current.map((source, sourceIndex) => sourceIndex === index ? value : source),
+    );
+  }
+
+  function addSkillSource(source = "") {
+    setSkillSources((current) => [...current, source]);
+  }
+
+  function removeSkillSource(index: number) {
+    setSkillSources((current) => {
+      const next = current.filter((_, sourceIndex) => sourceIndex !== index);
+      return next.length ? next : [""];
+    });
+  }
+
+  function pasteSkillSources(event: React.ClipboardEvent<HTMLInputElement>, index: number) {
+    const pasted = parseSkillSourceText(event.clipboardData.getData("text"));
+    if (pasted.length <= 1) return;
+    event.preventDefault();
+    setSkillSources((current) => [
+      ...current.slice(0, index),
+      ...pasted,
+      ...current.slice(index + 1),
+    ]);
+  }
+
+  function handleSkillSourceKeyDown(event: React.KeyboardEvent<HTMLInputElement>, index: number) {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    setSkillSources((current) => [
+      ...current.slice(0, index + 1),
+      "",
+      ...current.slice(index + 1),
+    ]);
   }
 
   return (
@@ -288,29 +407,54 @@ function App() {
           <div className="config-grid">
             <article className="config-editor">
               <header>
-                <h3>Skills</h3>
-                <div className="button-row">
-                  <button type="button" onClick={() => void importSkillSource()}>
-                    Import Source
-                  </button>
-                  <button type="button" onClick={() => void importSkill()}>
-                    Import Markdown
-                  </button>
+                <div>
+                  <h3>Skills</h3>
+                  <small>{skills.length} installed / {normalizeSkillSources(skillSources).length} sources</small>
                 </div>
               </header>
-              <label className="source-field">
-                <span>Source</span>
-                <input
-                  value={skillSource}
-                  onChange={(event) => setSkillSource(event.target.value)}
-                  placeholder="owner/repo, owner/repo/path, owner/repo@skill, or GitHub tree URL"
-                />
-              </label>
-              <textarea
-                spellCheck={false}
-                value={skillMarkdown}
-                onChange={(event) => setSkillMarkdown(event.target.value)}
-              />
+              <div className="source-field">
+                <div className="field-heading">
+                  <span>Sources</span>
+                  <button type="button" className="text-button" onClick={() => addSkillSource()}>
+                    Add Source
+                  </button>
+                </div>
+                <div className="source-list">
+                  {skillSources.map((source, index) => (
+                    <div className="source-row" key={index}>
+                      <span className="source-index">{index + 1}</span>
+                      <input
+                        className="source-input"
+                        value={source}
+                        onChange={(event) => updateSkillSource(index, event.target.value)}
+                        onPaste={(event) => pasteSkillSources(event, index)}
+                        onKeyDown={(event) => handleSkillSourceKeyDown(event, index)}
+                        placeholder={SKILL_SOURCE_PLACEHOLDERS[index % SKILL_SOURCE_PLACEHOLDERS.length]}
+                      />
+                      <button
+                        type="button"
+                        className="icon-button danger-button"
+                        onClick={() => removeSkillSource(index)}
+                        aria-label="Remove source"
+                        title="Remove source"
+                      >
+                        x
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <div className="source-actions">
+                  <button type="button" onClick={() => void saveSkillSources()}>
+                    Save Sources
+                  </button>
+                  <button type="button" className="primary-button" onClick={() => void importSkillSource()}>
+                    Import Sources
+                  </button>
+                  <button type="button" onClick={() => void reimportSkillSources()}>
+                    Reimport Saved
+                  </button>
+                </div>
+              </div>
               <div className="skill-list">
                 {skills.length === 0 ? (
                   <p>No skills installed.</p>
@@ -329,18 +473,81 @@ function App() {
 
             <article className="config-editor">
               <header>
-                <h3>MCP Servers</h3>
+                <div>
+                  <h3>MCP Servers</h3>
+                  <small>{mcpStatus.length} configured</small>
+                </div>
+                <div className="button-row">
+                  <button type="button" onClick={() => void refreshMcpStatus()}>
+                    Test
+                  </button>
+                  <button
+                    type="button"
+                    className="primary-button"
+                    onClick={() => void saveConfig("/api/agent/settings/mcp", mcpText)}
+                  >
+                    Save
+                  </button>
+                </div>
+              </header>
+              <textarea
+                className="json-editor"
+                spellCheck={false}
+                value={mcpText}
+                onChange={(event) => setMcpText(event.target.value)}
+              />
+              <div className="mcp-status-list">
+                {mcpStatus.length === 0 ? (
+                  <p>No MCP servers tested.</p>
+                ) : (
+                  mcpStatus.map((server) => (
+                    <section className={`mcp-status ${server.status}`} key={server.name}>
+                      <div>
+                        <strong>{server.name}</strong>
+                        <span>{server.status}{server.cached ? " / cached" : ""}</span>
+                      </div>
+                      <small>{server.transport ?? server.url}</small>
+                      <div className="metric-row">
+                        <span>{server.toolCount ?? 0} tools</span>
+                        <span>{server.promptCount ?? 0} prompts</span>
+                        <span>{server.resourceCount ?? 0} resources</span>
+                      </div>
+                      {server.headerNames?.length ? (
+                        <small>Headers: {server.headerNames.join(", ")}</small>
+                      ) : null}
+                      {server.error ? <p>{server.error}</p> : null}
+                      {server.tools?.length ? (
+                        <div className="catalog-list">
+                          {server.tools.slice(0, 6).map((tool) => (
+                            <span key={tool.name}>{tool.name}</span>
+                          ))}
+                        </div>
+                      ) : null}
+                    </section>
+                  ))
+                )}
+              </div>
+            </article>
+
+            <article className="config-editor">
+              <header>
+                <div>
+                  <h3>Permissions</h3>
+                  <small>tool pattern to ask / allow / deny</small>
+                </div>
                 <button
                   type="button"
-                  onClick={() => void saveConfig("/api/agent/settings/mcp", mcpText)}
+                  className="primary-button"
+                  onClick={() => void saveConfig("/api/agent/settings/permissions", permissionText)}
                 >
                   Save
                 </button>
               </header>
               <textarea
+                className="json-editor compact"
                 spellCheck={false}
-                value={mcpText}
-                onChange={(event) => setMcpText(event.target.value)}
+                value={permissionText}
+                onChange={(event) => setPermissionText(event.target.value)}
               />
             </article>
           </div>
@@ -363,21 +570,17 @@ async function responseError(response: Response) {
   return typeof body?.error === "string" ? body.error : `HTTP ${response.status}`;
 }
 
-const DEFAULT_SKILL_TEMPLATE = `---
-name: my-skill
-description: What this skill does and when to use it
----
+const SKILL_SOURCE_PLACEHOLDERS = [
+  "vercel-labs/agent-skills",
+  "owner/repo/skills/my-skill",
+  "owner/repo@skill-name",
+  "https://github.com/owner/repo/tree/main/skills/example",
+];
 
-# My Skill
+function parseSkillSourceText(value: string) {
+  return value.split(/[\s,]+/).map((source) => source.trim()).filter(Boolean);
+}
 
-Instructions for the agent to follow when this skill is activated.
-
-## When to Use
-
-Describe the scenarios where this skill should be used.
-
-## Steps
-
-1. First, do this
-2. Then, do that
-`;
+function normalizeSkillSources(values: string[]) {
+  return [...new Set(values.flatMap(parseSkillSourceText))];
+}

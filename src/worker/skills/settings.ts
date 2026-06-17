@@ -5,13 +5,11 @@ const MAX_SKILLS = 50;
 const MAX_SKILL_NAME_CHARS = 64;
 const MAX_SKILL_DESCRIPTION_CHARS = 500;
 const MAX_SKILL_CONTENT_CHARS = 50_000;
-const MAX_SKILL_MARKDOWN_CHARS = 80_000;
-const MAX_SKILL_IMPORT_FILES = 200;
-const MAX_SKILL_IMPORT_FILE_CHARS = 80_000;
 const MAX_SKILL_RESOURCE_FILES = 20;
 const MAX_SKILL_RESOURCE_CHARS = 20_000;
 const MAX_SKILL_RESOURCE_TOTAL_CHARS = 80_000;
 const MAX_INLINE_RESOURCE_CHARS = 8_000;
+const MAX_SKILL_SOURCES = 20;
 
 export const SKILL_SETTINGS_KEY = "skills";
 
@@ -46,24 +44,11 @@ export const SkillDefinitionSchema = z.object({
   sourcePath: z.string().trim().max(300).optional(),
 });
 
-export const SkillSettingsSchema = z.object({
-  skills: z.array(SkillDefinitionSchema).max(MAX_SKILLS).default([]),
-});
+export const SkillSourceStringSchema = z.string().trim().min(1).max(500);
 
-export const SkillMarkdownImportSchema = z.object({
-  markdown: z.string().trim().min(1).max(MAX_SKILL_MARKDOWN_CHARS),
-  files: z
-    .array(
-      z.object({
-        path: z.string().trim().min(1).max(300),
-        content: z.string().max(MAX_SKILL_IMPORT_FILE_CHARS),
-      }),
-    )
-    .max(MAX_SKILL_IMPORT_FILES)
-    .optional()
-    .default([]),
-  sourcePath: z.string().trim().max(300).optional(),
-  includeInternal: z.boolean().optional().default(false),
+export const SkillSettingsSchema = z.object({
+  sources: z.array(SkillSourceStringSchema).max(MAX_SKILL_SOURCES).default([]),
+  skills: z.array(SkillDefinitionSchema).max(MAX_SKILLS).default([]),
 });
 
 export type SkillDefinition = z.infer<typeof SkillDefinitionSchema>;
@@ -77,43 +62,33 @@ export function parseSkillSettingsPayload(payload: unknown): SkillSettings {
   return dedupeSkills(result.data);
 }
 
-export function parseSkillDefinitionPayload(payload: unknown): SkillDefinition {
-  const markdown = SkillMarkdownImportSchema.safeParse(payload);
-  if (markdown.success) {
-    return parseSkillMarkdown(markdown.data.markdown, {
-      sourcePath: markdown.data.sourcePath,
-      includeInternal: markdown.data.includeInternal,
-      files: markdown.data.files,
-    });
-  }
-
-  const result = SkillDefinitionSchema.safeParse(payload);
-  if (!result.success) {
-    throw new Error(formatZodError("Invalid skill", result.error));
-  }
-  return result.data;
-}
-
-export function parseSkillMarkdownPayload(payload: unknown): SkillDefinition {
-  const result = SkillMarkdownImportSchema.safeParse(payload);
-  if (!result.success) {
-    throw new Error(formatZodError("Invalid skill markdown", result.error));
-  }
-  return parseSkillMarkdown(result.data.markdown, {
-    sourcePath: result.data.sourcePath,
-    includeInternal: result.data.includeInternal,
-    files: result.data.files,
-  });
-}
-
 export function dedupeSkills(settings: SkillSettings): SkillSettings {
   const byName = new Map<string, SkillDefinition>();
   for (const skill of settings.skills) {
     byName.set(skill.name, skill);
   }
   return {
+    sources: normalizeSkillSources(settings.sources),
     skills: [...byName.values()].sort((left, right) => left.name.localeCompare(right.name)),
   };
+}
+
+export function normalizeSkillSources(values: string[]) {
+  const seen = new Set<string>();
+  const sources: string[] = [];
+  for (const value of values.flatMap(splitSourceText)) {
+    if (seen.has(value)) continue;
+    seen.add(value);
+    sources.push(value);
+  }
+  return sources.slice(0, MAX_SKILL_SOURCES);
+}
+
+function splitSourceText(value: string) {
+  return value
+    .split(/[\s,]+/)
+    .map((source) => source.trim())
+    .filter(Boolean);
 }
 
 export function skillGuidance(skills: SkillDefinition[]) {

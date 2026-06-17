@@ -347,7 +347,7 @@ describe("UserAgentObject run state", () => {
     });
   });
 
-  it("imports standard SKILL.md and exposes available skill guidance", async () => {
+  it("imports source skills and exposes available skill guidance", async () => {
     const sql = new FakeSqlStorage();
     const object = createObject(sql);
     const markdown = [
@@ -360,16 +360,18 @@ describe("UserAgentObject run state", () => {
       "Break the work into sequenced steps.",
     ].join("\n");
 
+    vi.stubGlobal("fetch", createGitHubSkillSourceFetchMock({
+      "skills/planning/SKILL.md": markdown,
+    }));
     const imported = await object.fetch(
-      jsonRequest("/settings/skills/import", { markdown }),
+      jsonRequest("/settings/skills/source", {
+        source: "vercel-labs/agent-skills/skills/planning",
+      }),
     );
     expect(imported.status).toBe(200);
     await expect(imported.json()).resolves.toMatchObject({
       ok: true,
-      skill: {
-        name: "planning",
-        description: "Use when turning goals into concrete next steps",
-      },
+      imported: ["planning"],
     });
 
     const capturedRequests: unknown[] = [];
@@ -440,6 +442,100 @@ describe("UserAgentObject run state", () => {
     expect(resultText).toContain("print('group changes')");
   });
 
+  it("imports multiple skills sources in one request", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql);
+
+    vi.stubGlobal("fetch", createGitHubSkillSourceFetchMock({
+      "skills/release-notes/SKILL.md": [
+        "---",
+        "name: release-notes",
+        "description: Draft release notes from structured changes",
+        "---",
+        "# Release Notes",
+        "",
+        "Use structured changes.",
+      ].join("\n"),
+      "skills/planning/SKILL.md": [
+        "---",
+        "name: planning",
+        "description: Turn fuzzy goals into concrete next steps",
+        "---",
+        "# Planning",
+        "",
+        "Break the work down.",
+      ].join("\n"),
+    }));
+
+    const imported = await object.fetch(
+      jsonRequest("/settings/skills/source", {
+        sources: [
+          "vercel-labs/agent-skills/skills/release-notes",
+          "vercel-labs/agent-skills/skills/planning",
+        ],
+      }),
+    );
+
+    expect(imported.status).toBe(200);
+    const body = (await imported.json()) as {
+      imported?: string[];
+      settings?: { sources?: string[]; skills?: Array<{ name: string }> };
+    };
+    expect(body.imported).toEqual(["release-notes", "planning"]);
+    expect(body.settings?.sources).toEqual([
+      "vercel-labs/agent-skills/skills/release-notes",
+      "vercel-labs/agent-skills/skills/planning",
+    ]);
+    expect(body.settings?.skills?.map((skill) => skill.name)).toEqual([
+      "planning",
+      "release-notes",
+    ]);
+  });
+
+  it("saves skill sources separately and reimports them later", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql);
+
+    vi.stubGlobal("fetch", createGitHubSkillSourceFetchMock({
+      "skills/planning/SKILL.md": [
+        "---",
+        "name: planning",
+        "description: Turn fuzzy goals into concrete next steps",
+        "---",
+        "# Planning",
+        "",
+        "Break the work down.",
+      ].join("\n"),
+    }));
+
+    const saved = await object.fetch(
+      jsonRequest(
+        "/settings/skills/sources",
+        { sources: ["vercel-labs/agent-skills/skills/planning"] },
+        "PUT",
+      ),
+    );
+    expect(saved.status).toBe(200);
+    await expect(saved.json()).resolves.toMatchObject({
+      ok: true,
+      settings: {
+        sources: ["vercel-labs/agent-skills/skills/planning"],
+        skills: [],
+      },
+    });
+
+    const reimported = await object.fetch(jsonRequest("/settings/skills/reimport", {}));
+    expect(reimported.status).toBe(200);
+    await expect(reimported.json()).resolves.toMatchObject({
+      ok: true,
+      imported: ["planning"],
+      settings: {
+        sources: ["vercel-labs/agent-skills/skills/planning"],
+        skills: [{ name: "planning" }],
+      },
+    });
+  });
+
   it("stores MCP settings and summarizes header names without values", async () => {
     const sql = new FakeSqlStorage();
     const object = createObject(sql);
@@ -479,6 +575,109 @@ describe("UserAgentObject run state", () => {
     const stateText = JSON.stringify(await state.json());
     expect(stateText).toContain("Authorization");
     expect(stateText).not.toContain("secret-token");
+  });
+
+  it("refreshes MCP status with tools prompts and resources", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql);
+    vi.stubGlobal("fetch", createMcpCatalogFetchMock());
+
+    await object.fetch(
+      jsonRequest(
+        "/settings/mcp",
+        {
+          defaultTimeoutMs: 5000,
+          servers: {
+            demo: {
+              type: "remote",
+              url: "https://mcp.example.com/mcp",
+              headers: { Authorization: "Bearer secret-token" },
+            },
+          },
+        },
+        "PUT",
+      ),
+    );
+
+    const refreshed = await object.fetch(jsonRequest("/settings/mcp/refresh", {}));
+    expect(refreshed.status).toBe(200);
+    await expect(refreshed.json()).resolves.toMatchObject({
+      ok: true,
+      servers: [
+        {
+          name: "demo",
+          status: "connected",
+          cached: false,
+          headerNames: ["Authorization"],
+          toolCount: 1,
+          promptCount: 1,
+          resourceCount: 1,
+          tools: [{ name: "echo" }],
+          prompts: [{ name: "daily-summary" }],
+          resources: [{ uri: "mcp://demo/notes" }],
+        },
+      ],
+    });
+
+    const cached = await object.fetch(new Request("https://agent.test/settings/mcp/status"));
+    const text = JSON.stringify(await cached.json());
+    expect(text).toContain('"cached":true');
+    expect(text).toContain("Authorization");
+    expect(text).not.toContain("secret-token");
+  });
+
+  it("applies permission deny rules to agent tool calls", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql);
+    await object.fetch(
+      jsonRequest(
+        "/settings/permissions",
+        { rules: [{ tool: "fetch_url", action: "deny" }] },
+        "PUT",
+      ),
+    );
+
+    vi.stubGlobal(
+      "fetch",
+      createFetchMock([
+        openAiToolCallResponse("fetch_url", { url: "https://example.com" }),
+        openAiTextResponse("Denied handled."),
+      ]),
+    );
+
+    const events = await readEvents(await object.fetch(chatRequest("fetch example")));
+    const toolResult = events.find((event) => event.event === "tool_result");
+    expect(JSON.stringify((toolResult as Extract<AgentStreamEvent, { event: "tool_result" }>).data.result))
+      .toContain("Tool denied by permission policy: fetch_url");
+    expect(events.some((event) => event.event === "approval_required")).toBe(false);
+    expect(sql.pendingApprovals).toHaveLength(0);
+  });
+
+  it("applies permission allow rules to approval-gated tool calls", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql);
+    await object.fetch(
+      jsonRequest(
+        "/settings/permissions",
+        { rules: [{ tool: "fetch_url", action: "allow" }] },
+        "PUT",
+      ),
+    );
+
+    vi.stubGlobal(
+      "fetch",
+      createFetchMock([
+        openAiToolCallResponse("fetch_url", { url: "https://example.com" }),
+        openAiTextResponse("Fetched."),
+      ]),
+    );
+
+    const events = await readEvents(await object.fetch(chatRequest("fetch example")));
+    const toolResult = events.find((event) => event.event === "tool_result");
+    expect(JSON.stringify((toolResult as Extract<AgentStreamEvent, { event: "tool_result" }>).data.result))
+      .toContain("Example page body");
+    expect(events.some((event) => event.event === "approval_required")).toBe(false);
+    expect(sql.pendingApprovals).toHaveLength(0);
   });
 
   it("stores tasks and reschedules reminder alarms", async () => {
@@ -795,6 +994,88 @@ function createGitHubSkillSourceFetchMock(files: Record<string, string>) {
 
     throw new Error(`Unexpected fetch: ${url}`);
   });
+}
+
+function createMcpCatalogFetchMock() {
+  return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = input instanceof Request ? input.url : String(input);
+    if (url !== "https://mcp.example.com/mcp") {
+      throw new Error(`Unexpected MCP fetch: ${url}`);
+    }
+
+    const method = input instanceof Request ? input.method : init?.method;
+    if (method === "GET") {
+      return new Response("Method Not Allowed", { status: 405 });
+    }
+
+    const body = input instanceof Request
+      ? await input.clone().json()
+      : typeof init?.body === "string"
+        ? JSON.parse(init.body) as Record<string, unknown>
+        : {};
+    const request = body as { id?: string | number; method?: string; params?: Record<string, unknown> };
+
+    if (request.method === "notifications/initialized") {
+      return new Response(null, { status: 202 });
+    }
+
+    const response = jsonRpcResponse(request.id);
+    if (request.method === "initialize") {
+      response.result = {
+        protocolVersion: "2025-06-18",
+        capabilities: { tools: {}, prompts: {}, resources: {} },
+        serverInfo: { name: "fake-mcp", version: "1.0.0" },
+      };
+    } else if (request.method === "tools/list") {
+      response.result = {
+        tools: [
+          {
+            name: "echo",
+            description: "Echo input text.",
+            inputSchema: {
+              type: "object",
+              properties: { text: { type: "string" } },
+            },
+          },
+        ],
+      };
+    } else if (request.method === "prompts/list") {
+      response.result = {
+        prompts: [
+          {
+            name: "daily-summary",
+            description: "Summarize the day.",
+          },
+        ],
+      };
+    } else if (request.method === "resources/list") {
+      response.result = {
+        resources: [
+          {
+            uri: "mcp://demo/notes",
+            name: "notes",
+            mimeType: "text/plain",
+          },
+        ],
+      };
+    } else {
+      response.error = { code: -32601, message: `Unknown method: ${request.method}` };
+    }
+
+    return Response.json(response);
+  });
+}
+
+function jsonRpcResponse(id: string | number | undefined) {
+  return {
+    jsonrpc: "2.0",
+    id: id ?? null,
+  } as {
+    jsonrpc: "2.0";
+    id: string | number | null;
+    result?: unknown;
+    error?: { code: number; message: string };
+  };
 }
 
 async function readRequestJson(input: RequestInfo | URL, init?: RequestInit) {

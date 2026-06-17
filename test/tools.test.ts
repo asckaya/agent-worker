@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
+import { createMcpToolDefinitions } from "../src/worker/mcp/tools";
+import { parseGitHubSource } from "../src/worker/skills/source";
 import { createDefaultToolRegistry } from "../src/worker/tools";
 import { arxivSearchTool } from "../src/worker/tools/arxiv";
 import { calculateTool, currentTimeTool } from "../src/worker/tools/basic";
+import { importSkillSourcesTool } from "../src/worker/tools/config";
 import { capToolResult, ToolExecutor } from "../src/worker/tools/executor";
 import { fetchUrlTool } from "../src/worker/tools/fetch-url";
 import {
@@ -29,15 +32,23 @@ describe("tool registry", () => {
       "delete_mcp_server",
       "delete_skill",
       "fetch_url",
+      "get_mcp_prompt",
+      "get_mcp_status",
       "github_get_repository",
       "github_read_file",
       "github_search_repositories",
       "http_request",
+      "import_skill_sources",
+      "list_mcp_prompts",
+      "list_mcp_resources",
+      "read_mcp_resource",
+      "refresh_mcp_tools",
+      "reimport_skill_sources",
       "save_memory",
       "search_memory",
+      "set_skill_sources",
       "skill",
       "upsert_mcp_server",
-      "upsert_skill",
     ]);
     expect(tools.find((tool) => tool.function.name === "fetch_url")?.function.parameters).toMatchObject({
       type: "object",
@@ -56,6 +67,7 @@ describe("tool registry", () => {
     expect(createDefaultToolRegistry().get("github_search_repositories")?.toolset).toBe("github");
     expect(createDefaultToolRegistry().get("save_memory")?.toolset).toBe("memory");
     expect(createDefaultToolRegistry().get("skill")?.toolset).toBe("skills");
+    expect(createDefaultToolRegistry().get("import_skill_sources")?.toolset).toBe("skills");
     expect(createDefaultToolRegistry().get("upsert_mcp_server")?.toolset).toBe("mcp");
   });
 
@@ -165,6 +177,134 @@ describe("tool executor", () => {
     ).resolves.toEqual({ status: "executed", result: { echoed: "approved" } });
   });
 
+  it("applies permission decisions before approval gating", async () => {
+    const registry = new ToolRegistry();
+    const execute = vi.fn(async () => ({ ok: true }));
+    registry.register({
+      name: "external_tool",
+      description: "External tool",
+      inputSchema: z.object({}),
+      risk: "external",
+      requiresApproval: true,
+      execute,
+    });
+    const context = {
+      fetch,
+      saveMemory: async () => undefined,
+      searchMemory: async () => [],
+    };
+
+    await expect(
+      new ToolExecutor(registry, context, {
+        permissionEvaluator: () => ({ action: "deny" }),
+      }).executeStoredTool("external_tool", {}),
+    ).resolves.toEqual({
+      status: "executed",
+      result: { error: "Tool denied by permission policy: external_tool" },
+    });
+    expect(execute).not.toHaveBeenCalled();
+
+    await expect(
+      new ToolExecutor(registry, context, {
+        permissionEvaluator: () => ({ action: "allow" }),
+      }).executeStoredTool("external_tool", {}),
+    ).resolves.toEqual({
+      status: "executed",
+      result: { ok: true },
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("imports skill sources through the skill configuration tool", async () => {
+    const registry = new ToolRegistry();
+    registry.register(importSkillSourcesTool);
+    const importSources = vi.fn(async () => [
+      {
+        name: "planning",
+        description: "Plan work",
+        content: "Break work down.",
+        files: [],
+      },
+    ]);
+    const executor = new ToolExecutor(registry, {
+      fetch,
+      saveMemory: async () => undefined,
+      searchMemory: async () => [],
+      skills: {
+        list: async () => [],
+        listSources: async () => [],
+        setSources: async (sources) => sources,
+        importSources,
+        reimportSources: async () => [],
+        delete: async () => false,
+      },
+    });
+
+    await expect(
+      executor.executeStoredTool(
+        "import_skill_sources",
+        { sources: ["vercel-labs/agent-skills/skills/planning"] },
+        { bypassApproval: true },
+      ),
+    ).resolves.toEqual({
+      status: "executed",
+      result: {
+        ok: true,
+        imported: ["planning"],
+        count: 1,
+      },
+    });
+    expect(importSources).toHaveBeenCalledWith({
+      includeInternal: false,
+      sources: ["vercel-labs/agent-skills/skills/planning"],
+    });
+  });
+
+  it("creates and executes dynamic MCP tools from configured remote servers", async () => {
+    const mcpFetch = createMcpFetchMock();
+    const tools = await createMcpToolDefinitions(
+      {
+        servers: {
+          demo: {
+            type: "remote",
+            url: "https://mcp.example.com/mcp",
+            headers: undefined,
+            disabled: false,
+          },
+        },
+      },
+      mcpFetch,
+    );
+    expect(tools.map((tool) => tool.name)).toEqual(["mcp_demo_echo"]);
+
+    const registry = new ToolRegistry();
+    registry.register(tools[0]);
+    const executor = new ToolExecutor(registry, {
+      fetch: mcpFetch,
+      saveMemory: async () => undefined,
+      searchMemory: async () => [],
+    });
+
+    await expect(
+      executor.executeStoredTool(
+        "mcp_demo_echo",
+        { text: "hello" },
+        { bypassApproval: true },
+      ),
+    ).resolves.toEqual({
+      status: "executed",
+      result: {
+        toolName: "echo",
+        text: "echo: hello",
+        structuredContent: undefined,
+        attachments: [],
+        metadata: undefined,
+      },
+    });
+    expect(mcpFetch.methods).toContain("tools/list");
+    expect(mcpFetch.methods).toContain("tools/call");
+  });
+
   it("caps oversized tool results before returning them to the model", async () => {
     const registry = new ToolRegistry();
     registry.register({
@@ -196,6 +336,87 @@ describe("tool executor", () => {
     });
     expect(capToolResult({ name: "small_tool", maxResultChars: 100 }, { ok: true })).toEqual({
       ok: true,
+    });
+  });
+});
+
+function createMcpFetchMock() {
+  const methods: string[] = [];
+  const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = input instanceof Request ? input.url : String(input);
+    if (url !== "https://mcp.example.com/mcp") {
+      throw new Error(`Unexpected MCP fetch: ${url}`);
+    }
+
+    const method = input instanceof Request ? input.method : init?.method;
+    if (method === "GET") {
+      return new Response("Method Not Allowed", { status: 405 });
+    }
+
+    const body = input instanceof Request
+      ? await input.clone().json()
+      : typeof init?.body === "string"
+        ? JSON.parse(init.body) as Record<string, unknown>
+        : {};
+    const request = body as { id?: string | number; method?: string; params?: Record<string, unknown> };
+    if (request.method) methods.push(request.method);
+
+    if (request.method === "notifications/initialized") {
+      return new Response(null, { status: 202 });
+    }
+
+    const response = jsonRpcResponse(request.id);
+    if (request.method === "initialize") {
+      response.result = {
+        protocolVersion: "2025-06-18",
+        capabilities: { tools: {} },
+        serverInfo: { name: "fake-mcp", version: "1.0.0" },
+      };
+    } else if (request.method === "tools/list") {
+      response.result = {
+        tools: [
+          {
+            name: "echo",
+            description: "Echo input text.",
+            inputSchema: {
+              type: "object",
+              properties: { text: { type: "string" } },
+            },
+          },
+        ],
+      };
+    } else if (request.method === "tools/call") {
+      const params = request.params ?? {};
+      const args = (params.arguments ?? {}) as { text?: unknown };
+      response.result = {
+        content: [{ type: "text", text: `echo: ${String(args.text ?? "")}` }],
+      };
+    } else {
+      response.error = { code: -32601, message: `Unknown method: ${request.method}` };
+    }
+
+    return Response.json(response);
+  }) as typeof fetch & { methods: string[] };
+  fetcher.methods = methods;
+  return fetcher;
+}
+
+function jsonRpcResponse(id: string | number | undefined) {
+  return {
+    jsonrpc: "2.0",
+    id: id ?? null,
+  } as {
+    jsonrpc: "2.0";
+    id: string | number | null;
+    result?: unknown;
+    error?: { code: number; message: string };
+  };
+}
+
+describe("skill sources", () => {
+  it("parses skills package GitHub SSH source strings", () => {
+    expect(parseGitHubSource("git@github.com:vercel-labs/agent-skills.git")).toEqual({
+      ownerRepo: "vercel-labs/agent-skills",
     });
   });
 });

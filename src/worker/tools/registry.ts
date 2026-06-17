@@ -21,10 +21,15 @@ export interface ToolContext {
   searchMemory: (query: string) => Promise<string[]>;
   skills?: {
     list: () => Promise<SkillDefinition[]>;
-    upsert: (skill: unknown) => Promise<void>;
+    listSources: () => Promise<string[]>;
+    setSources: (sources: string[]) => Promise<string[]>;
+    importSources: (payload: unknown) => Promise<SkillDefinition[]>;
+    reimportSources: () => Promise<SkillDefinition[]>;
     delete: (name: string) => Promise<boolean>;
   };
   mcp?: {
+    status: () => Promise<unknown>;
+    refresh: (name?: string) => Promise<unknown>;
     upsertPublicServer: (server: {
       name: string;
       url: string;
@@ -32,6 +37,10 @@ export interface ToolContext {
       timeoutMs?: number;
     }) => Promise<void>;
     deleteServer: (name: string) => Promise<boolean>;
+    listPrompts: (server?: string) => Promise<unknown>;
+    getPrompt: (server: string, name: string, args?: Record<string, string>) => Promise<unknown>;
+    listResources: (server?: string) => Promise<unknown>;
+    readResource: (server: string, uri: string) => Promise<unknown>;
   };
 }
 

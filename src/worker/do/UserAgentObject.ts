@@ -11,8 +11,17 @@ import {
   mcpServerSummary,
   parseMcpSettingsPayload,
   type McpSettings,
+  type RemoteMcpServer,
 } from "../mcp/settings";
-import { createMcpToolDefinitions } from "../mcp/tools";
+import {
+  createMcpToolDefinitionsFromSnapshots,
+  getMcpPrompt,
+  inspectMcpServer,
+  markMcpStatusCached,
+  mcpServerSignature,
+  readMcpResource,
+  type McpServerSnapshot,
+} from "../mcp/tools";
 import {
   createEnvLlmSettings,
   getActiveLlmProfile,
@@ -26,15 +35,14 @@ import {
 import { streamChatCompletion } from "../model/openai-compatible";
 import {
   dedupeSkills,
-  parseSkillDefinitionPayload,
-  parseSkillMarkdownPayload,
+  normalizeSkillSources,
   parseSkillSettingsPayload,
   SKILL_SETTINGS_KEY,
   skillGuidance,
   type SkillDefinition,
   type SkillSettings,
 } from "../skills/settings";
-import { importSkillsFromSource } from "../skills/source";
+import { importSkillsFromSource, SkillSourceImportSchema } from "../skills/source";
 import { createDefaultToolRegistry } from "../tools";
 import { DEFAULT_TOOL_TIMEOUT_MS, ToolExecutor } from "../tools/executor";
 import {
@@ -44,6 +52,13 @@ import {
   ToolRunGuardrails,
 } from "../tools/guardrails";
 import { ToolRegistry, type ToolContext, type ToolDefinition } from "../tools/registry";
+import {
+  evaluateToolPermission,
+  PERMISSION_SETTINGS_KEY,
+  parsePermissionSettingsPayload,
+  permissionSettingsSummary,
+  type PermissionSettings,
+} from "../tools/permissions";
 import type {
   ActiveAgentRun,
   ChannelSource,
@@ -81,6 +96,7 @@ const MAX_ACTIVE_RUN_FOLLOW_UPS = 3;
 const MAX_TASKS = 200;
 const MAX_SESSION_TITLE_CHARS = 80;
 const TASK_ALARM_RETRY_DELAY_MS = 60_000;
+const MCP_TOOL_CACHE_TTL_MS = 5 * 60_000;
 
 interface AgentCallbacks {
   onMeta?: (data: Record<string, unknown>) => Promise<void>;
@@ -184,6 +200,7 @@ export class UserAgentObject {
   private readonly memoryProvider: DurableObjectMemoryProvider;
   private readonly activeRuns = new Map<string, ActiveRunRecord>();
   private readonly pausedApprovals = new Map<string, PausedApprovalSession>();
+  private readonly mcpSnapshots = new Map<string, McpServerSnapshot>();
 
   constructor(
     private readonly ctx: DurableObjectState,
@@ -209,6 +226,7 @@ export class UserAgentObject {
         llm: this.getLlmSettingsSummary(),
         skills: this.getSkillSettingsSummary(),
         mcp: this.getMcpSettingsSummary(),
+        permissions: this.getPermissionSettingsSummary(),
         limits: {
           maxMemoryItems: MAX_MEMORY_ITEMS,
           maxMemoryChars: MAX_MEMORY_CHARS,
@@ -292,12 +310,16 @@ export class UserAgentObject {
       return this.handleUpdateSkillSettings(request);
     }
 
-    if (request.method === "POST" && url.pathname === "/settings/skills/import") {
-      return this.handleImportSkillMarkdown(request);
-    }
-
     if (request.method === "POST" && url.pathname === "/settings/skills/source") {
       return this.handleImportSkillSource(request);
+    }
+
+    if (request.method === "PUT" && url.pathname === "/settings/skills/sources") {
+      return this.handleUpdateSkillSources(request);
+    }
+
+    if (request.method === "POST" && url.pathname === "/settings/skills/reimport") {
+      return this.handleReimportSkillSources();
     }
 
     if (request.method === "DELETE" && url.pathname === "/settings/skills") {
@@ -317,12 +339,58 @@ export class UserAgentObject {
       return this.handleUpdateMcpSettings(request);
     }
 
+    if (request.method === "GET" && url.pathname === "/settings/mcp/status") {
+      return this.handleMcpStatus(url);
+    }
+
+    if (request.method === "POST" && url.pathname === "/settings/mcp/refresh") {
+      return this.handleRefreshMcp(request);
+    }
+
     if (request.method === "DELETE" && url.pathname === "/settings/mcp") {
       this.deleteRuntimeSetting(MCP_SETTINGS_KEY);
+      this.invalidateMcpSnapshots();
       return Response.json({
         ok: true,
         settings: this.getMcpSettings(),
         summary: this.getMcpSettingsSummary(),
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/settings/permissions") {
+      return Response.json({
+        ok: true,
+        settings: this.getPermissionSettings(),
+        summary: this.getPermissionSettingsSummary(),
+      });
+    }
+
+    if (request.method === "PUT" && url.pathname === "/settings/permissions") {
+      return this.handleUpdatePermissionSettings(request);
+    }
+
+    if (request.method === "DELETE" && url.pathname === "/settings/permissions") {
+      this.deleteRuntimeSetting(PERMISSION_SETTINGS_KEY);
+      return Response.json({
+        ok: true,
+        settings: this.getPermissionSettings(),
+        summary: this.getPermissionSettingsSummary(),
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/settings/runtime") {
+      return Response.json({
+        ok: true,
+        settings: {
+          skills: this.getSkillSettings(),
+          mcp: this.getMcpSettings(),
+          permissions: this.getPermissionSettings(),
+        },
+        summary: {
+          skills: this.getSkillSettingsSummary(),
+          mcp: this.getMcpSettingsSummary(),
+          permissions: this.getPermissionSettingsSummary(),
+        },
       });
     }
 
@@ -552,22 +620,8 @@ export class UserAgentObject {
   private async handleUpdateSkillSettings(request: Request) {
     try {
       const settings = parseSkillSettingsPayload(await request.json().catch(() => ({})));
-      this.saveRuntimeSetting(SKILL_SETTINGS_KEY, settings);
+      this.saveSkillSettings(settings);
       return Response.json({ ok: true, settings: this.getSkillSettings() });
-    } catch (error) {
-      return errorResponse(error);
-    }
-  }
-
-  private async handleImportSkillMarkdown(request: Request) {
-    try {
-      const skill = parseSkillMarkdownPayload(await request.json().catch(() => ({})));
-      this.upsertSkill(skill);
-      return Response.json({
-        ok: true,
-        skill: this.getSkillSettings().skills.find((item) => item.name === skill.name),
-        settings: this.getSkillSettings(),
-      });
     } catch (error) {
       return errorResponse(error);
     }
@@ -575,13 +629,41 @@ export class UserAgentObject {
 
   private async handleImportSkillSource(request: Request) {
     try {
-      const skills = await importSkillsFromSource(await request.json().catch(() => ({})), {
-        fetchImpl: (input, init) => fetch(input, init),
-        token: this.env.GITHUB_TOKEN,
+      const payload = await request.json().catch(() => ({}));
+      const skills = await this.importAndStoreSkillSources(payload, { saveSources: true });
+      return Response.json({
+        ok: true,
+        imported: skills.map((skill) => skill.name),
+        settings: this.getSkillSettings(),
       });
-      for (const skill of skills) {
-        this.upsertSkill(skill);
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  private async handleUpdateSkillSources(request: Request) {
+    try {
+      const payload = (await request.json().catch(() => ({}))) as { sources?: unknown };
+      if (!Array.isArray(payload.sources)) {
+        throw new HttpError("sources must be an array.", 400);
       }
+      const next = parseSkillSettingsPayload({
+        ...this.getSkillSettings(),
+        sources: normalizeSkillSources(payload.sources.map(String)),
+      });
+      this.saveSkillSettings(next);
+      return Response.json({
+        ok: true,
+        settings: this.getSkillSettings(),
+      });
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  private async handleReimportSkillSources() {
+    try {
+      const skills = await this.reimportSavedSkillSources();
       return Response.json({
         ok: true,
         imported: skills.map((skill) => skill.name),
@@ -596,10 +678,44 @@ export class UserAgentObject {
     try {
       const settings = parseMcpSettingsPayload(await request.json().catch(() => ({})));
       this.saveRuntimeSetting(MCP_SETTINGS_KEY, settings);
+      this.invalidateMcpSnapshots();
       return Response.json({
         ok: true,
         settings: this.getMcpSettings(),
         summary: this.getMcpSettingsSummary(),
+      });
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  private async handleMcpStatus(url: URL) {
+    try {
+      const name = url.searchParams.get("name")?.trim() || undefined;
+      return Response.json(await this.getMcpStatusResponse({ name }));
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  private async handleRefreshMcp(request: Request) {
+    try {
+      const body = (await request.json().catch(() => ({}))) as { name?: unknown };
+      const name = typeof body.name === "string" && body.name.trim() ? body.name.trim() : undefined;
+      return Response.json(await this.getMcpStatusResponse({ name, force: true }));
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  private async handleUpdatePermissionSettings(request: Request) {
+    try {
+      const settings = parsePermissionSettingsPayload(await request.json().catch(() => ({})));
+      this.saveRuntimeSetting(PERMISSION_SETTINGS_KEY, settings);
+      return Response.json({
+        ok: true,
+        settings: this.getPermissionSettings(),
+        summary: this.getPermissionSettingsSummary(),
       });
     } catch (error) {
       return errorResponse(error);
@@ -936,6 +1052,7 @@ export class UserAgentObject {
     const toolRecovery = new ToolLoopRecovery();
     const toolExecutor = new ToolExecutor(registry, this.createToolContext(), {
       timeoutMs: DEFAULT_TOOL_TIMEOUT_MS,
+      permissionEvaluator: (tool) => evaluateToolPermission(tool, this.getPermissionSettings()),
       approvalGate: {
         create: async ({ tool, input }) =>
           this.createPendingApproval(options.source, options.sessionId, tool, input),
@@ -1530,18 +1647,20 @@ export class UserAgentObject {
       "SELECT key, value_json, updated_at FROM runtime_settings WHERE key = ? LIMIT 1",
       SKILL_SETTINGS_KEY,
     )[0];
-    if (!row) return { skills: [] };
+    if (!row) return { sources: [], skills: [] };
 
     try {
       return parseSkillSettingsPayload(JSON.parse(row.value_json));
     } catch {
-      return { skills: [] };
+      return { sources: [], skills: [] };
     }
   }
 
   private getSkillSettingsSummary() {
     const settings = this.getSkillSettings();
     return {
+      sourceCount: settings.sources.length,
+      sources: settings.sources,
       count: settings.skills.length,
       skills: settings.skills.map((skill) => ({
         name: skill.name,
@@ -1566,10 +1685,29 @@ export class UserAgentObject {
 
   private getMcpSettingsSummary() {
     const settings = this.getMcpSettings();
+    const summary = mcpServerSummary(settings);
     return {
       serverCount: Object.keys(settings.servers).length,
-      servers: mcpServerSummary(settings),
+      ...summary,
     };
+  }
+
+  private getPermissionSettings(): PermissionSettings {
+    const row = this.query<RuntimeSettingRow>(
+      "SELECT key, value_json, updated_at FROM runtime_settings WHERE key = ? LIMIT 1",
+      PERMISSION_SETTINGS_KEY,
+    )[0];
+    if (!row) return { rules: [] };
+
+    try {
+      return parsePermissionSettingsPayload(JSON.parse(row.value_json));
+    } catch {
+      return { rules: [] };
+    }
+  }
+
+  private getPermissionSettingsSummary() {
+    return permissionSettingsSummary(this.getPermissionSettings());
   }
 
   private getLlmSettingsResponse() {
@@ -1601,13 +1739,98 @@ export class UserAgentObject {
 
   private async createToolRegistry() {
     const registry = createDefaultToolRegistry(this.env);
-    const mcpTools = await createMcpToolDefinitions(this.getMcpSettings(), (input, init) =>
-      fetch(input, init),
-    );
+    const mcpSettings = this.getMcpSettings();
+    const mcpSnapshots = await this.getMcpSnapshots({ force: false });
+    const mcpTools = createMcpToolDefinitionsFromSnapshots(mcpSettings, mcpSnapshots);
     for (const tool of mcpTools) {
       registry.register(tool);
     }
     return registry;
+  }
+
+  private async getMcpStatusResponse(options: { force?: boolean; name?: string } = {}) {
+    const settings = this.getMcpSettings();
+    const snapshots = await this.getMcpSnapshots(options);
+    return {
+      ok: true,
+      summary: this.getMcpSettingsSummary(),
+      servers: [...snapshots.values()]
+        .sort((left, right) => left.serverName.localeCompare(right.serverName))
+        .map((snapshot) => ({
+          ...snapshot.status,
+          tools: snapshot.tools.map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+          })),
+          prompts: snapshot.prompts.map(summarizeMcpCatalogItem),
+          resources: snapshot.resources.map(summarizeMcpCatalogItem),
+        })),
+      settings: {
+        defaultTimeoutMs: settings.defaultTimeoutMs,
+        servers: mcpServerSummary(settings).servers,
+      },
+    };
+  }
+
+  private async getMcpSnapshots(options: { force?: boolean; name?: string } = {}) {
+    const settings = this.getMcpSettings();
+    const targetEntries = Object.entries(settings.servers).filter(([name]) =>
+      options.name ? name === options.name : true,
+    );
+    if (options.name && targetEntries.length === 0) {
+      throw new HttpError(`Unknown MCP server: ${options.name}`, 404);
+    }
+
+    const configuredNames = new Set(Object.keys(settings.servers));
+    for (const name of this.mcpSnapshots.keys()) {
+      if (!configuredNames.has(name)) this.mcpSnapshots.delete(name);
+    }
+
+    const snapshots = await Promise.all(
+      targetEntries.map(async ([serverName, server]) => {
+        const signature = mcpServerSignature(server, settings.defaultTimeoutMs);
+        const cached = this.mcpSnapshots.get(serverName);
+        if (
+          !options.force &&
+          cached &&
+          cached.signature === signature &&
+          cached.expiresAt > Date.now()
+        ) {
+          return {
+            ...cached,
+            status: markMcpStatusCached(cached.status),
+          };
+        }
+
+        const snapshot = await inspectMcpServer(
+          serverName,
+          server,
+          (input, init) => fetch(input, init),
+          {
+            defaultTimeoutMs: settings.defaultTimeoutMs,
+            ttlMs: MCP_TOOL_CACHE_TTL_MS,
+          },
+        );
+        this.mcpSnapshots.set(serverName, snapshot);
+        return snapshot;
+      }),
+    );
+
+    return new Map(snapshots.map((snapshot) => [snapshot.serverName, snapshot]));
+  }
+
+  private invalidateMcpSnapshots(name?: string) {
+    if (name) {
+      this.mcpSnapshots.delete(name);
+      return;
+    }
+    this.mcpSnapshots.clear();
+  }
+
+  private requireMcpServer(name: string): RemoteMcpServer {
+    const server = this.getMcpSettings().servers[name];
+    if (!server) throw new HttpError(`Unknown MCP server: ${name}`, 404);
+    return server;
   }
 
   private getActiveRun(source: ChannelSource | undefined) {
@@ -2542,12 +2765,24 @@ export class UserAgentObject {
       searchMemory: async (query) => this.searchMemory(query),
       skills: {
         list: async () => this.getSkillSettings().skills,
-        upsert: async (skill) => {
-          this.upsertSkill(parseSkillDefinitionPayload(skill));
+        listSources: async () => this.getSkillSettings().sources,
+        setSources: async (sources) => {
+          const nextSources = normalizeSkillSources(sources);
+          this.saveSkillSettings({
+            ...this.getSkillSettings(),
+            sources: nextSources,
+          });
+          return nextSources;
         },
+        importSources: async (payload) => {
+          return this.importAndStoreSkillSources(payload, { saveSources: true });
+        },
+        reimportSources: async () => this.reimportSavedSkillSources(),
         delete: async (name) => this.deleteSkill(name),
       },
       mcp: {
+        status: async () => this.getMcpStatusResponse(),
+        refresh: async (name) => this.getMcpStatusResponse({ force: true, name }),
         upsertPublicServer: async (server) => {
           const current = this.getMcpSettings();
           current.servers[server.name] = {
@@ -2558,30 +2793,113 @@ export class UserAgentObject {
             timeoutMs: server.timeoutMs,
           };
           this.saveRuntimeSetting(MCP_SETTINGS_KEY, current);
+          this.invalidateMcpSnapshots(server.name);
         },
         deleteServer: async (name) => {
           const current = this.getMcpSettings();
           const existed = current.servers[name] !== undefined;
           delete current.servers[name];
           this.saveRuntimeSetting(MCP_SETTINGS_KEY, current);
+          this.invalidateMcpSnapshots(name);
           return existed;
         },
+        listPrompts: async (server) => this.listMcpPrompts(server),
+        getPrompt: async (server, name, args) =>
+          getMcpPrompt(
+            this.requireMcpServer(server),
+            name,
+            args,
+            (input, init) => fetch(input, init),
+            this.getMcpSettings().defaultTimeoutMs,
+          ),
+        listResources: async (server) => this.listMcpResources(server),
+        readResource: async (server, uri) =>
+          readMcpResource(
+            this.requireMcpServer(server),
+            uri,
+            (input, init) => fetch(input, init),
+            this.getMcpSettings().defaultTimeoutMs,
+          ),
       },
     };
+  }
+
+  private async importAndStoreSkillSources(
+    payload: unknown,
+    options: { saveSources: boolean },
+  ) {
+    const parsed = SkillSourceImportSchema.safeParse(payload);
+    if (!parsed.success) {
+      throw new Error(`Invalid skill source: ${parsed.error.issues[0]?.message ?? "schema error"}`);
+    }
+    const skills = await importSkillsFromSource(parsed.data, {
+      fetchImpl: (input, init) => fetch(input, init),
+      token: this.env.GITHUB_TOKEN,
+    });
+    const current = this.getSkillSettings();
+    const incomingSources = normalizeSkillSources([
+      ...(parsed.data.source ? [parsed.data.source] : []),
+      ...(parsed.data.sources ?? []),
+    ]);
+    this.saveSkillSettings({
+      sources: options.saveSources
+        ? normalizeSkillSources([...current.sources, ...incomingSources])
+        : current.sources,
+      skills: [
+        ...current.skills.filter((skill) => !skills.some((item) => item.name === skill.name)),
+        ...skills,
+      ],
+    });
+    return skills;
+  }
+
+  private async reimportSavedSkillSources() {
+    const sources = this.getSkillSettings().sources;
+    if (sources.length === 0) throw new HttpError("No skill sources are saved.", 400);
+    return this.importAndStoreSkillSources({ sources }, { saveSources: false });
+  }
+
+  private async listMcpPrompts(server?: string) {
+    const snapshots = await this.getMcpSnapshots({ name: server });
+    return {
+      prompts: [...snapshots.values()].flatMap((snapshot) =>
+        snapshot.prompts.map((prompt) => ({
+          server: snapshot.serverName,
+          ...summarizeMcpCatalogItem(prompt),
+        })),
+      ),
+    };
+  }
+
+  private async listMcpResources(server?: string) {
+    const snapshots = await this.getMcpSnapshots({ name: server });
+    return {
+      resources: [...snapshots.values()].flatMap((snapshot) =>
+        snapshot.resources.map((resource) => ({
+          server: snapshot.serverName,
+          ...summarizeMcpCatalogItem(resource),
+        })),
+      ),
+    };
+  }
+
+  private saveSkillSettings(settings: SkillSettings) {
+    this.saveRuntimeSetting(SKILL_SETTINGS_KEY, dedupeSkills(settings));
   }
 
   private upsertSkill(skill: SkillDefinition) {
     const current = this.getSkillSettings();
     const next = dedupeSkills({
+      sources: current.sources,
       skills: [...current.skills.filter((item) => item.name !== skill.name), skill],
     });
-    this.saveRuntimeSetting(SKILL_SETTINGS_KEY, next);
+    this.saveSkillSettings(next);
   }
 
   private deleteSkill(name: string) {
     const current = this.getSkillSettings();
     const next = current.skills.filter((skill) => skill.name !== name);
-    this.saveRuntimeSetting(SKILL_SETTINGS_KEY, { skills: next });
+    this.saveSkillSettings({ sources: current.sources, skills: next });
     return next.length !== current.skills.length;
   }
 
@@ -2651,6 +2969,15 @@ function parseStoredJson(value: string) {
   } catch {
     return {};
   }
+}
+
+function summarizeMcpCatalogItem(item: Record<string, unknown>) {
+  return {
+    name: typeof item.name === "string" ? item.name : undefined,
+    uri: typeof item.uri === "string" ? item.uri : undefined,
+    description: typeof item.description === "string" ? item.description : undefined,
+    mimeType: typeof item.mimeType === "string" ? item.mimeType : undefined,
+  };
 }
 
 function formatApprovalRequiredMessage(approval: PendingToolApproval) {

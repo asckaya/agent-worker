@@ -1,4 +1,5 @@
 import type { PendingToolApproval, ToolCall } from "../types";
+import type { PermissionDecision } from "./permissions";
 import type { ToolContext, ToolDefinition, ToolRegistry } from "./registry";
 
 export const DEFAULT_TOOL_TIMEOUT_MS = 10_000;
@@ -25,6 +26,7 @@ export type ToolExecutionOutcome =
 export interface ToolExecutorOptions {
   timeoutMs?: number;
   approvalGate?: ToolApprovalGate;
+  permissionEvaluator?: (tool: ToolDefinition) => PermissionDecision;
 }
 
 export class ToolExecutor {
@@ -78,7 +80,15 @@ export class ToolExecutor {
       );
     }
 
-    if (tool.requiresApproval && !options.bypassApproval) {
+    const permission = this.options.permissionEvaluator?.(tool) ?? {
+      action: tool.requiresApproval ? "ask" : "allow",
+    };
+
+    if (permission.action === "deny") {
+      return executedError(`Tool denied by permission policy: ${tool.name}`);
+    }
+
+    if (permission.action === "ask" && !options.bypassApproval) {
       if (!this.options.approvalGate) {
         return executedError(`Tool requires approval: ${tool.name}`);
       }

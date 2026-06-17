@@ -3,9 +3,17 @@ import { calculateTool, currentTimeTool } from "./basic";
 import {
   deleteMcpServerTool,
   deleteSkillTool,
+  getMcpPromptTool,
+  getMcpStatusTool,
+  importSkillSourcesTool,
+  listMcpPromptsTool,
+  listMcpResourcesTool,
+  readMcpResourceTool,
+  refreshMcpToolsTool,
+  reimportSkillSourcesTool,
+  setSkillSourcesTool,
   skillTool,
   upsertMcpServerTool,
-  upsertSkillTool,
 } from "./config";
 import { fetchUrlTool } from "./fetch-url";
 import {
@@ -31,9 +39,17 @@ export function createDefaultToolRegistry(env?: Env) {
   registry.register(saveMemoryTool);
   registry.register(searchMemoryTool);
   registry.register(skillTool);
-  registry.register(upsertSkillTool);
+  registry.register(importSkillSourcesTool);
+  registry.register(setSkillSourcesTool);
+  registry.register(reimportSkillSourcesTool);
   registry.register(deleteSkillTool);
+  registry.register(getMcpStatusTool);
+  registry.register(refreshMcpToolsTool);
   registry.register(upsertMcpServerTool);
   registry.register(deleteMcpServerTool);
+  registry.register(listMcpPromptsTool);
+  registry.register(getMcpPromptTool);
+  registry.register(listMcpResourcesTool);
+  registry.register(readMcpResourceTool);
   return registry;
 }

@@ -1,7 +1,9 @@
 import { z } from "zod";
 import {
+  normalizeSkillSources,
   parseSkillMarkdown,
   SkillNameSchema,
+  SkillSourceStringSchema,
   type SkillDefinition,
 } from "./settings";
 
@@ -16,37 +18,71 @@ const PRIORITY_PREFIXES = [
   "skills/.curated/",
   "skills/.experimental/",
   "skills/.system/",
+  ".aider-desk/skills/",
   ".agents/skills/",
+  "data/skills/",
+  ".autohand/skills/",
+  ".augment/skills/",
+  ".bob/skills/",
   ".claude/skills/",
+  ".codeartsdoer/skills/",
   ".cline/skills/",
   ".codebuddy/skills/",
+  ".codemaker/skills/",
+  ".codestudio/skills/",
   ".codex/skills/",
   ".commandcode/skills/",
   ".continue/skills/",
+  ".cortex/skills/",
+  ".crush/skills/",
+  ".devin/skills/",
+  ".factory/skills/",
+  ".forge/skills/",
   ".github/skills/",
   ".goose/skills/",
+  ".hermes/skills/",
+  ".inferencesh/skills/",
+  ".jazz/skills/",
   ".iflow/skills/",
   ".junie/skills/",
   ".kilocode/skills/",
   ".kiro/skills/",
+  ".kode/skills/",
+  ".lingma/skills/",
+  ".mcpjam/skills/",
+  ".vibe/skills/",
+  ".moxby/skills/",
   ".mux/skills/",
   ".neovate/skills/",
+  ".ona/skills/",
   ".opencode/skills/",
   ".openhands/skills/",
   ".pi/skills/",
   ".qoder/skills/",
+  ".qwen/skills/",
+  ".reasonix/skills/",
+  ".rovodev/skills/",
   ".roo/skills/",
+  ".tabnine/agent/skills/",
+  ".terramind/skills/",
+  ".tinycloud/skills/",
   ".trae/skills/",
   ".windsurf/skills/",
   ".zencoder/skills/",
+  ".adal/skills/",
 ];
 
 const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", "__pycache__"]);
 
+const MAX_SKILL_SOURCES = 20;
+
 export const SkillSourceImportSchema = z.object({
-  source: z.string().trim().min(1).max(500),
+  source: SkillSourceStringSchema.optional(),
+  sources: z.array(SkillSourceStringSchema).max(MAX_SKILL_SOURCES).optional(),
   skill: SkillNameSchema.optional(),
   includeInternal: z.boolean().optional().default(false),
+}).refine((value) => Boolean(value.source || value.sources?.length), {
+  message: "Provide source or sources.",
 });
 
 export type SkillSourceImport = z.infer<typeof SkillSourceImportSchema>;
@@ -84,8 +120,33 @@ export async function importSkillsFromSource(
     throw new Error(formatZodError("Invalid skill source", input.error));
   }
 
-  const source = parseGitHubSource(input.data.source);
-  const skillFilter = input.data.skill ?? source.skillFilter;
+  const sources = normalizeSourceList(input.data);
+  const byName = new Map<string, SkillDefinition>();
+  for (const sourceText of sources) {
+    try {
+      const skills = await importSingleGitHubSource(sourceText, input.data, options);
+      for (const skill of skills) {
+        byName.set(skill.name, skill);
+        if (byName.size >= MAX_IMPORTED_SKILLS) break;
+      }
+    } catch (error) {
+      throw new Error(`Could not import ${sourceText}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (byName.size >= MAX_IMPORTED_SKILLS) break;
+  }
+  if (byName.size === 0) {
+    throw new Error("No importable skills found in sources.");
+  }
+  return [...byName.values()];
+}
+
+async function importSingleGitHubSource(
+  sourceText: string,
+  input: SkillSourceImport,
+  options: ImportOptions,
+) {
+  const source = parseGitHubSource(sourceText);
+  const skillFilter = input.skill ?? source.skillFilter;
   const fetchImpl = options.fetchImpl ?? fetch;
   const tree = await fetchRepoTree(source.ownerRepo, source.ref, fetchImpl, options.token);
   if (!tree) {
@@ -127,7 +188,7 @@ export async function importSkillsFromSource(
     try {
       const parsed = parseSkillMarkdown(markdown, {
         sourcePath: skillMdPath,
-        includeInternal: input.data.includeInternal,
+        includeInternal: input.includeInternal,
         files: files.flatMap((file) =>
           file.content === null ? [] : [{ path: file.path, content: file.content }],
         ),
@@ -136,7 +197,7 @@ export async function importSkillsFromSource(
         skills.push(parsed);
       }
     } catch (error) {
-      if (input.data.includeInternal || !String(error).includes("is internal")) throw error;
+      if (input.includeInternal || !String(error).includes("is internal")) throw error;
     }
   }
 
@@ -146,6 +207,25 @@ export async function importSkillsFromSource(
       : "No importable skills found in source.");
   }
   return skills;
+}
+
+function normalizeSourceList(input: SkillSourceImport) {
+  const values = [
+    ...(input.source ? splitSourceText(input.source) : []),
+    ...(input.sources ?? []).flatMap(splitSourceText),
+  ];
+  const sources = normalizeSkillSources(values);
+  if (sources.length === 0) {
+    throw new Error("Provide at least one skill source.");
+  }
+  return sources.slice(0, MAX_SKILL_SOURCES);
+}
+
+function splitSourceText(value: string) {
+  return value
+    .split(/[\s,]+/)
+    .map((source) => source.trim())
+    .filter(Boolean);
 }
 
 export function parseGitHubSource(input: string): GitHubSource {
@@ -181,6 +261,12 @@ export function parseGitHubSource(input: string): GitHubSource {
   const githubRepo = source.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/);
   if (githubRepo) {
     const [, owner, repo] = githubRepo;
+    return withFragmentFields({ ownerRepo: normalizeOwnerRepo(owner, repo) }, fragment);
+  }
+
+  const githubSshRepo = source.match(/^git@github\.com:([^/]+)\/([^/]+?)(?:\.git)?$/);
+  if (githubSshRepo) {
+    const [, owner, repo] = githubSshRepo;
     return withFragmentFields({ ownerRepo: normalizeOwnerRepo(owner, repo) }, fragment);
   }
 

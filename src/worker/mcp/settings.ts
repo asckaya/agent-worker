@@ -4,6 +4,7 @@ const MAX_MCP_SERVERS = 20;
 const MAX_MCP_NAME_CHARS = 64;
 const MAX_MCP_HEADERS = 20;
 const MAX_MCP_HEADER_VALUE_CHARS = 4_000;
+const McpTimeoutMsSchema = z.number().int().min(1_000).max(60_000);
 
 export const MCP_SETTINGS_KEY = "mcp";
 
@@ -31,14 +32,16 @@ export const RemoteMcpServerSchema = z.object({
       headers ? Object.fromEntries(Object.entries(headers).slice(0, MAX_MCP_HEADERS)) : undefined,
     ),
   disabled: z.boolean().optional().default(false),
-  timeoutMs: z.number().int().min(1_000).max(60_000).optional(),
+  timeoutMs: McpTimeoutMsSchema.optional(),
 });
 
 export const McpSettingsSchema = z
   .object({
+    defaultTimeoutMs: McpTimeoutMsSchema.optional(),
     servers: z.record(McpServerNameSchema, RemoteMcpServerSchema).default({}),
   })
   .transform((settings) => ({
+    ...(settings.defaultTimeoutMs !== undefined ? { defaultTimeoutMs: settings.defaultTimeoutMs } : {}),
     servers: Object.fromEntries(Object.entries(settings.servers).slice(0, MAX_MCP_SERVERS)),
   }));
 
@@ -46,7 +49,7 @@ export const PublicMcpServerUpdateSchema = z.object({
   name: McpServerNameSchema,
   url: RemoteMcpServerSchema.shape.url,
   disabled: z.boolean().optional(),
-  timeoutMs: RemoteMcpServerSchema.shape.timeoutMs,
+  timeoutMs: McpTimeoutMsSchema.optional(),
 });
 
 export type RemoteMcpServer = z.infer<typeof RemoteMcpServerSchema>;
@@ -70,16 +73,20 @@ export function parsePublicMcpServerUpdatePayload(payload: unknown): PublicMcpSe
 }
 
 export function mcpServerSummary(settings: McpSettings) {
-  return Object.entries(settings.servers)
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([name, server]) => ({
-      name,
-      type: server.type,
-      url: server.url,
-      disabled: server.disabled,
-      timeoutMs: server.timeoutMs,
-      headerNames: Object.keys(server.headers ?? {}),
-    }));
+  return {
+    defaultTimeoutMs: settings.defaultTimeoutMs,
+    servers: Object.entries(settings.servers)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([name, server]) => ({
+        name,
+        type: server.type,
+        url: server.url,
+        disabled: server.disabled,
+        timeoutMs: server.timeoutMs,
+        effectiveTimeoutMs: server.timeoutMs ?? settings.defaultTimeoutMs,
+        headerNames: Object.keys(server.headers ?? {}),
+      })),
+  };
 }
 
 function formatZodError(prefix: string, error: z.ZodError) {
