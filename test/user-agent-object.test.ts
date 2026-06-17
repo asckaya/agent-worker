@@ -551,6 +551,11 @@ describe("UserAgentObject run state", () => {
               headers: {
                 Authorization: "Bearer secret-token",
               },
+              oauth: {
+                clientId: "client-id",
+                clientSecret: "oauth-secret",
+                scope: "read write",
+              },
             },
           },
         },
@@ -566,6 +571,12 @@ describe("UserAgentObject run state", () => {
           {
             name: "search",
             headerNames: ["Authorization"],
+            oauth: {
+              enabled: true,
+              hasClientId: true,
+              hasClientSecret: true,
+              scope: "read write",
+            },
           },
         ],
       },
@@ -574,7 +585,9 @@ describe("UserAgentObject run state", () => {
     const state = await object.fetch(new Request("https://agent.test/state"));
     const stateText = JSON.stringify(await state.json());
     expect(stateText).toContain("Authorization");
+    expect(stateText).toContain("hasClientSecret");
     expect(stateText).not.toContain("secret-token");
+    expect(stateText).not.toContain("oauth-secret");
   });
 
   it("refreshes MCP status with tools prompts and resources", async () => {
@@ -678,6 +691,88 @@ describe("UserAgentObject run state", () => {
       .toContain("Example page body");
     expect(events.some((event) => event.event === "approval_required")).toBe(false);
     expect(sql.pendingApprovals).toHaveLength(0);
+  });
+
+  it("remembers always-approved tools as allow rules", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql);
+    vi.stubGlobal(
+      "fetch",
+      createFetchMock([
+        openAiToolCallResponse("fetch_url", { url: "https://example.com" }),
+        openAiTextResponse("Approved summary."),
+        openAiToolCallResponse("fetch_url", { url: "https://example.com" }),
+        openAiTextResponse("Fetched without approval."),
+      ]),
+    );
+
+    const firstEvents = await readEvents(await object.fetch(chatRequest("fetch example")));
+    const approval = approvalFromEvents(firstEvents);
+    const approvedEvents = await readEvents(
+      await object.fetch(
+        jsonRequest(`/approvals/${encodeURIComponent(approval.id)}/approve-stream`, {
+          source: { channel: "telegram", chatId: "123" },
+          llm: llmConfig(),
+          approvalMode: "always",
+        }),
+      ),
+    );
+    expect(doneContent(approvedEvents)).toContain("Approved summary.");
+
+    const permissions = await object.fetch(new Request("https://agent.test/settings/permissions"));
+    await expect(permissions.json()).resolves.toMatchObject({
+      settings: {
+        rules: [{ tool: "fetch_url", action: "allow" }],
+      },
+    });
+
+    const nextEvents = await readEvents(await object.fetch(chatRequest("fetch again")));
+    expect(nextEvents.some((event) => event.event === "approval_required")).toBe(false);
+    expect(JSON.stringify(nextEvents)).toContain("Example page body");
+  });
+
+  it("stores oversized tool outputs as artifacts and records activity", async () => {
+    const sql = new FakeSqlStorage();
+    const object = createObject(sql);
+    await object.fetch(
+      jsonRequest(
+        "/settings/permissions",
+        { rules: [{ tool: "fetch_url", action: "allow" }] },
+        "PUT",
+      ),
+    );
+    vi.stubGlobal(
+      "fetch",
+      createFetchMock([
+        openAiToolCallResponse("fetch_url", { url: "https://large.example.com" }),
+        openAiTextResponse("Large fetched."),
+      ]),
+    );
+
+    const events = await readEvents(await object.fetch(chatRequest("fetch large page")));
+    const toolResult = events.find((event) => event.event === "tool_result");
+    expect(toolResult).toBeDefined();
+    const result = (toolResult as Extract<AgentStreamEvent, { event: "tool_result" }>).data
+      .result as { outputId?: string; artifact?: boolean; truncated?: boolean };
+    expect(result).toMatchObject({ artifact: true, truncated: true });
+    expect(result.outputId).toEqual(expect.any(String));
+
+    const output = await object.fetch(
+      new Request(`https://agent.test/tool-outputs/${encodeURIComponent(result.outputId ?? "")}`),
+    );
+    await expect(output.json()).resolves.toMatchObject({
+      ok: true,
+      output: {
+        id: result.outputId,
+        toolName: "fetch_url",
+      },
+    });
+    expect(sql.toolOutputs[0]?.content).toContain("large-content");
+
+    const activity = await object.fetch(new Request("https://agent.test/activity?limit=20"));
+    const activityText = JSON.stringify(await activity.json());
+    expect(activityText).toContain("tool_call");
+    expect(activityText).toContain("tool_result");
   });
 
   it("stores tasks and reschedules reminder alarms", async () => {
@@ -939,6 +1034,12 @@ function createFetchMock(llmResponses: MockLlmResponse[]) {
 
     if (url === "https://example.com/") {
       return new Response("Example page body", {
+        headers: { "Content-Type": "text/plain" },
+      });
+    }
+
+    if (url === "https://large.example.com/") {
+      return new Response(`large-content:${"x".repeat(130_000)}`, {
         headers: { "Content-Type": "text/plain" },
       });
     }
@@ -1247,6 +1348,30 @@ interface ChatMessageRow {
   created_at: number;
 }
 
+interface ToolOutputRow {
+  id: string;
+  channel: string;
+  chat_id: string;
+  session_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  content: string;
+  size: number;
+  created_at: number;
+  expires_at: number;
+}
+
+interface ActivityRow {
+  id: string;
+  type: string;
+  channel: string | null;
+  chat_id: string | null;
+  session_id: string | null;
+  summary: string;
+  data_json: string;
+  created_at: number;
+}
+
 class FakeSqlStorage {
   readonly memories: StoredMemory[] = [];
   readonly pendingApprovals: PendingApprovalRow[] = [];
@@ -1255,6 +1380,8 @@ class FakeSqlStorage {
   readonly chatSessions: ChatSessionRow[] = [];
   readonly activeChatSessions: ActiveChatSessionRow[] = [];
   readonly chatMessages: ChatMessageRow[] = [];
+  readonly toolOutputs: ToolOutputRow[] = [];
+  readonly activityLog: ActivityRow[] = [];
   alarm: number | null = null;
 
   exec(sql: string, ...bindings: Array<string | number | null>) {
@@ -1530,6 +1657,97 @@ class FakeSqlStorage {
       return this.sortedTasks().slice(0, Number(bindings[0]));
     }
 
+    if (normalized.startsWith("INSERT INTO tool_outputs")) {
+      const [
+        id,
+        channel,
+        chatId,
+        sessionId,
+        toolCallId,
+        toolName,
+        content,
+        size,
+        createdAt,
+        expiresAt,
+      ] = bindings;
+      this.toolOutputs.push({
+        id: String(id),
+        channel: String(channel),
+        chat_id: String(chatId),
+        session_id: String(sessionId),
+        tool_call_id: String(toolCallId),
+        tool_name: String(toolName),
+        content: String(content),
+        size: Number(size),
+        created_at: Number(createdAt),
+        expires_at: Number(expiresAt),
+      });
+      return [];
+    }
+
+    if (normalized === "DELETE FROM tool_outputs WHERE expires_at <= ?") {
+      this.deleteRows(this.toolOutputs, (output) => output.expires_at <= Number(bindings[0]));
+      return [];
+    }
+
+    if (normalized === "SELECT id FROM tool_outputs ORDER BY created_at DESC") {
+      return this.sortedToolOutputs().map(({ id }) => ({ id }));
+    }
+
+    if (normalized === "DELETE FROM tool_outputs WHERE id = ?") {
+      this.deleteRows(this.toolOutputs, (output) => output.id === bindings[0]);
+      return [];
+    }
+
+    if (
+      normalized.startsWith("SELECT id, channel, chat_id, session_id, tool_call_id, tool_name, size, created_at, expires_at FROM tool_outputs WHERE expires_at > ?")
+    ) {
+      const [now, limit] = bindings;
+      return this.sortedToolOutputs()
+        .filter((output) => output.expires_at > Number(now))
+        .slice(0, Number(limit))
+        .map(({ content, ...output }) => output);
+    }
+
+    if (
+      normalized.startsWith("SELECT id, channel, chat_id, session_id, tool_call_id, tool_name, content, size, created_at, expires_at FROM tool_outputs WHERE id = ?")
+    ) {
+      const [id, now] = bindings;
+      return this.toolOutputs
+        .filter((output) => output.id === id && output.expires_at > Number(now))
+        .slice(0, 1);
+    }
+
+    if (normalized.startsWith("INSERT INTO activity_log")) {
+      const [id, type, channel, chatId, sessionId, summary, dataJson, createdAt] = bindings;
+      this.activityLog.push({
+        id: String(id),
+        type: String(type),
+        channel: channel === null ? null : String(channel),
+        chat_id: chatId === null ? null : String(chatId),
+        session_id: sessionId === null ? null : String(sessionId),
+        summary: String(summary),
+        data_json: String(dataJson),
+        created_at: Number(createdAt),
+      });
+      return [];
+    }
+
+    if (normalized === "SELECT id FROM activity_log ORDER BY created_at DESC") {
+      return this.sortedActivity().map(({ id }) => ({ id }));
+    }
+
+    if (normalized === "DELETE FROM activity_log WHERE id = ?") {
+      this.deleteRows(this.activityLog, (activity) => activity.id === bindings[0]);
+      return [];
+    }
+
+    if (
+      normalized.startsWith("SELECT id, type, channel, chat_id, session_id, summary, data_json, created_at FROM activity_log ORDER BY created_at DESC LIMIT ?")
+    ) {
+      return this.sortedActivity().slice(0, Number(bindings[0]));
+    }
+
     if (normalized.startsWith("INSERT INTO pending_approvals")) {
       const [
         id,
@@ -1620,6 +1838,18 @@ class FakeSqlStorage {
       const rightDue = right.due_at ?? Number.POSITIVE_INFINITY;
       return leftDue - rightDue || right.created_at - left.created_at;
     });
+  }
+
+  private sortedToolOutputs() {
+    return this.toolOutputs
+      .slice()
+      .sort((left, right) => right.created_at - left.created_at);
+  }
+
+  private sortedActivity() {
+    return this.activityLog
+      .slice()
+      .sort((left, right) => right.created_at - left.created_at);
   }
 
   private deleteRows<T>(rows: T[], predicate: (row: T) => boolean) {

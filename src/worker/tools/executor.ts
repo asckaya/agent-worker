@@ -13,6 +13,14 @@ export interface ToolApprovalGate {
   create(request: ToolApprovalRequest): Promise<PendingToolApproval>;
 }
 
+export interface ToolOutputStore {
+  bound(request: {
+    tool: ToolDefinition;
+    toolCallId?: string;
+    result: unknown;
+  }): Promise<unknown>;
+}
+
 export type ToolExecutionOutcome =
   | {
       status: "executed";
@@ -27,6 +35,7 @@ export interface ToolExecutorOptions {
   timeoutMs?: number;
   approvalGate?: ToolApprovalGate;
   permissionEvaluator?: (tool: ToolDefinition) => PermissionDecision;
+  outputStore?: ToolOutputStore;
 }
 
 export class ToolExecutor {
@@ -50,13 +59,13 @@ export class ToolExecutor {
       return executedError(input.message);
     }
 
-    return this.executeTool(tool, input, options);
+    return this.executeTool(tool, input, { ...options, toolCallId: toolCall.id });
   }
 
   async executeStoredTool(
     toolName: string,
     input: unknown,
-    options: { bypassApproval?: boolean } = {},
+    options: { bypassApproval?: boolean; toolCallId?: string } = {},
   ): Promise<ToolExecutionOutcome> {
     const tool = this.registry.get(toolName);
     if (!tool) {
@@ -69,7 +78,7 @@ export class ToolExecutor {
   private async executeTool(
     tool: ToolDefinition,
     input: unknown,
-    options: { bypassApproval?: boolean },
+    options: { bypassApproval?: boolean; toolCallId?: string },
   ): Promise<ToolExecutionOutcome> {
     const parsedInput = tool.inputSchema.safeParse(input);
     if (!parsedInput.success) {
@@ -108,9 +117,12 @@ export class ToolExecutor {
         this.options.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS,
         `Tool timed out: ${tool.name}`,
       );
+      const bounded = this.options.outputStore
+        ? await this.options.outputStore.bound({ tool, toolCallId: options.toolCallId, result })
+        : capToolResult(tool, result);
       return {
         status: "executed",
-        result: capToolResult(tool, result),
+        result: bounded,
       };
     } catch (error) {
       return executedError(error instanceof Error ? error.message : "Tool execution failed.");

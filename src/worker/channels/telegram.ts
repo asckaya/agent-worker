@@ -139,7 +139,7 @@ interface IncomingTelegramFile {
 }
 
 type TelegramCallbackAction =
-  | { kind: "approval"; action: "approve" | "deny"; approvalId: string }
+  | { kind: "approval"; action: "approve" | "always" | "deny"; approvalId: string }
   | { kind: "menu"; view: "home" | "status" | "llm" | "memory" | "tasks" | "pending" | "stop" }
   | { kind: "memory_delete"; memoryId: string }
   | { kind: "task_done"; taskId: string };
@@ -477,18 +477,23 @@ async function handleApprovalCallback(
     return;
   }
 
-  await answerTelegramCallbackQuery(env, callback.callbackQueryId, "Approved. Running tool...");
+  const always = approvalAction.action === "always";
+  await answerTelegramCallbackQuery(
+    env,
+    callback.callbackQueryId,
+    always ? "Always allowed. Running tool..." : "Approved. Running tool...",
+  );
   await editTelegramMessage(
     env,
     callback.chatId,
     callback.messageId,
-    `Approved: ${approvalAction.approvalId}\nRunning tool...`,
+    `${always ? "Always allowed" : "Approved"}: ${approvalAction.approvalId}\nRunning tool...`,
     { replyMarkup: emptyTelegramInlineKeyboard() },
   );
   try {
     await handleApproveCommand(env, requestUrl, callback, command ?? {
       name: "approve",
-      args: approvalAction.approvalId,
+      args: always ? `${approvalAction.approvalId} always` : approvalAction.approvalId,
       raw: callback.text,
       botName: undefined,
     });
@@ -675,7 +680,7 @@ function helpText() {
     "/pending - list pending tool approvals",
     "/session - list or switch chat sessions",
     "/session new [title] - start a new chat session",
-    "/approve <id> - approve a pending tool call",
+    "/approve <id> [always] - approve a pending tool call",
     "/deny <id> - deny a pending tool call",
     "/stop - cancel the active response in this chat",
     "/new or /reset - clear the current chat context and stop any active response",
@@ -1100,9 +1105,10 @@ async function handleApproveCommand(
 ) {
   const approvalId = firstArg(command.args);
   if (!approvalId) {
-    await sendTelegramMessage(env, incoming.chatId, "Usage: /approve <id>", incoming.messageId);
+    await sendTelegramMessage(env, incoming.chatId, "Usage: /approve <id> [always]", incoming.messageId);
     return;
   }
+  const approvalMode = approvalCommandMode(command.args);
 
   const llm = await resolveRequiredChannelLlm(env, requestUrl, undefined, "Telegram");
   await streamAgentEndpointToTelegram(
@@ -1112,9 +1118,10 @@ async function handleApproveCommand(
     `/approvals/${encodeURIComponent(approvalId)}/approve-stream`,
     {
       source: { channel: "telegram", chatId: incoming.chatId },
+      approvalMode,
       ...(llm instanceof Error ? {} : { llm }),
     },
-    "Approving...",
+    approvalMode === "always" ? "Always allowing..." : "Approving...",
   );
 }
 
@@ -1959,10 +1966,11 @@ function extractTelegramCallback(update: TelegramUpdate): IncomingTelegramCallba
 function parseTelegramCallbackData(data: string): TelegramCallbackParseResult | null {
   const [prefix, action, value] = data.split(":");
   if (prefix !== TELEGRAM_APPROVAL_CALLBACK_PREFIX) return null;
-  if ((action === "approve" || action === "deny") && value) {
+  if ((action === "approve" || action === "always" || action === "deny") && value) {
+    const commandAction = action === "always" ? "approve" : action;
     return {
       action: { kind: "approval", action, approvalId: value },
-      text: `/${action} ${value}`,
+      text: `/${commandAction} ${value}${action === "always" ? " always" : ""}`,
     };
   }
   if (action === "menu" && isTelegramMenuView(value)) {
@@ -2724,8 +2732,12 @@ function telegramApprovalReplyMarkup(approvalId: string): TelegramReplyMarkup {
     inline_keyboard: [
       [
         {
-          text: "Approve",
+          text: "Approve once",
           callback_data: `${TELEGRAM_APPROVAL_CALLBACK_PREFIX}:approve:${approvalId}`,
+        },
+        {
+          text: "Always allow",
+          callback_data: `${TELEGRAM_APPROVAL_CALLBACK_PREFIX}:always:${approvalId}`,
         },
         {
           text: "Deny",
@@ -2760,9 +2772,14 @@ function formatPendingApproval(approval: PendingToolApproval) {
     `${approval.id}: ${approval.toolName}`,
     `Risk: ${approval.risk}`,
     `Input: ${stringifyShort(approval.toolInput, 500)}`,
-    `/approve ${approval.id}`,
+    `/approve ${approval.id} [always]`,
     `/deny ${approval.id}`,
   ].join("\n");
+}
+
+function approvalCommandMode(args: string): "once" | "always" {
+  const [, ...rest] = args.split(/\s+/).map((arg) => arg.trim().toLowerCase()).filter(Boolean);
+  return rest.includes("always") ? "always" : "once";
 }
 
 function formatSessionLine(session: StoredChatSession) {

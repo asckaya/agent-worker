@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { parse as parseYaml } from "yaml";
+import { contextProvider, type AgentContextProvider } from "../agent/context-providers";
 
 const MAX_SKILLS = 50;
 const MAX_SKILL_NAME_CHARS = 64;
@@ -107,6 +108,10 @@ export function skillGuidance(skills: SkillDefinition[]) {
     ]),
     "</available_skills>",
   ].join("\n");
+}
+
+export function skillContextProvider(skills: SkillDefinition[]): AgentContextProvider {
+  return contextProvider("skills/available", () => skillGuidance(skills));
 }
 
 export function formatSkillContent(skill: SkillDefinition) {

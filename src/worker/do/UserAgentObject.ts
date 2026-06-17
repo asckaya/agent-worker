@@ -2,12 +2,23 @@ import { buildClientHistoryMessages, buildModelMessages } from "../agent/context
 import {
   writeAgentStreamEvent,
 } from "../channels/sse";
+import {
+  auth,
+  type OAuthClientProvider,
+  type OAuthDiscoveryState,
+} from "@modelcontextprotocol/sdk/client/auth.js";
+import type {
+  OAuthClientInformationMixed,
+  OAuthClientMetadata,
+  OAuthTokens,
+} from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { AgentStreamEvent, AgentStreamEventName } from "../channels/types";
 import {
   DurableObjectMemoryProvider,
 } from "../memory/provider";
 import {
   MCP_SETTINGS_KEY,
+  mcpContextProvider,
   mcpServerSummary,
   parseMcpSettingsPayload,
   type McpSettings,
@@ -22,6 +33,16 @@ import {
   readMcpResource,
   type McpServerSnapshot,
 } from "../mcp/tools";
+import {
+  asOAuthClientInformation,
+  asOAuthDiscoveryState,
+  asOAuthTokens,
+  MCP_OAUTH_SETTINGS_KEY,
+  parseMcpOAuthSettingsPayload,
+  summarizeMcpOAuthState,
+  type McpOAuthServerState,
+  type McpOAuthSettings,
+} from "../mcp/oauth";
 import {
   createEnvLlmSettings,
   getActiveLlmProfile,
@@ -38,7 +59,7 @@ import {
   normalizeSkillSources,
   parseSkillSettingsPayload,
   SKILL_SETTINGS_KEY,
-  skillGuidance,
+  skillContextProvider,
   type SkillDefinition,
   type SkillSettings,
 } from "../skills/settings";
@@ -97,6 +118,11 @@ const MAX_TASKS = 200;
 const MAX_SESSION_TITLE_CHARS = 80;
 const TASK_ALARM_RETRY_DELAY_MS = 60_000;
 const MCP_TOOL_CACHE_TTL_MS = 5 * 60_000;
+const TOOL_OUTPUT_TTL_MS = 24 * 60 * 60_000;
+const MAX_TOOL_OUTPUT_ROWS = 100;
+const MAX_TOOL_OUTPUT_CHARS = 200_000;
+const MAX_ACTIVITY_ROWS = 300;
+const MAX_ACTIVITY_DATA_CHARS = 8_000;
 
 interface AgentCallbacks {
   onMeta?: (data: Record<string, unknown>) => Promise<void>;
@@ -163,6 +189,30 @@ interface ChatMessageRow {
   created_at: number;
 }
 
+interface ToolOutputRow {
+  id: string;
+  channel: string;
+  chat_id: string;
+  session_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  content: string;
+  size: number;
+  created_at: number;
+  expires_at: number;
+}
+
+interface ActivityRow {
+  id: string;
+  type: string;
+  channel: string | null;
+  chat_id: string | null;
+  session_id: string | null;
+  summary: string;
+  data_json: string;
+  created_at: number;
+}
+
 interface ActiveRunRecord extends Omit<ActiveAgentRun, "queuedMessageCount"> {
   key: string;
   abortController: AbortController;
@@ -189,6 +239,11 @@ interface AgentLoopOptions {
   sessionId?: string;
   signal?: AbortSignal;
   consumePendingFollowUps?: () => ChatRequest[];
+}
+
+interface ToolOutputContext {
+  source?: ChannelSource;
+  sessionId?: string;
 }
 
 interface ToolRecoveryDecision {
@@ -227,6 +282,8 @@ export class UserAgentObject {
         skills: this.getSkillSettingsSummary(),
         mcp: this.getMcpSettingsSummary(),
         permissions: this.getPermissionSettingsSummary(),
+        activity: this.getActivityLog({ limit: 10 }),
+        toolOutputs: this.getToolOutputs({ limit: 10 }),
         limits: {
           maxMemoryItems: MAX_MEMORY_ITEMS,
           maxMemoryChars: MAX_MEMORY_CHARS,
@@ -234,6 +291,29 @@ export class UserAgentObject {
           approvalTtlMs: APPROVAL_TTL_MS,
         },
       });
+    }
+
+    if (request.method === "GET" && url.pathname === "/activity") {
+      return Response.json({
+        ok: true,
+        events: this.getActivityLog({
+          limit: parseLimit(url.searchParams.get("limit"), 50, MAX_ACTIVITY_ROWS),
+        }),
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/tool-outputs") {
+      return Response.json({
+        ok: true,
+        outputs: this.getToolOutputs({
+          limit: parseLimit(url.searchParams.get("limit"), 50, MAX_TOOL_OUTPUT_ROWS),
+        }),
+      });
+    }
+
+    const toolOutputMatch = /^\/tool-outputs\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "GET" && toolOutputMatch) {
+      return this.handleGetToolOutput(decodeURIComponent(toolOutputMatch[1]));
     }
 
     if (request.method === "POST" && url.pathname === "/memories") {
@@ -347,8 +427,17 @@ export class UserAgentObject {
       return this.handleRefreshMcp(request);
     }
 
+    if (request.method === "POST" && url.pathname === "/settings/mcp/oauth/start") {
+      return this.handleStartMcpOAuth(request);
+    }
+
+    if (request.method === "GET" && url.pathname === "/settings/mcp/oauth/callback") {
+      return this.handleFinishMcpOAuth(url);
+    }
+
     if (request.method === "DELETE" && url.pathname === "/settings/mcp") {
       this.deleteRuntimeSetting(MCP_SETTINGS_KEY);
+      this.deleteRuntimeSetting(MCP_OAUTH_SETTINGS_KEY);
       this.invalidateMcpSnapshots();
       return Response.json({
         ok: true,
@@ -479,6 +568,16 @@ export class UserAgentObject {
       await this.scheduleNextTaskAlarm(
         shouldRetrySoon ? Date.now() + TASK_ALARM_RETRY_DELAY_MS : undefined,
       );
+    }
+  }
+
+  private handleGetToolOutput(id: string) {
+    try {
+      const output = this.getToolOutput(id);
+      if (!output) throw new HttpError("Tool output not found.", 404);
+      return Response.json({ ok: true, output });
+    } catch (error) {
+      return errorResponse(error);
     }
   }
 
@@ -678,6 +777,7 @@ export class UserAgentObject {
     try {
       const settings = parseMcpSettingsPayload(await request.json().catch(() => ({})));
       this.saveRuntimeSetting(MCP_SETTINGS_KEY, settings);
+      this.pruneMcpOAuthSettings(settings);
       this.invalidateMcpSnapshots();
       return Response.json({
         ok: true,
@@ -702,7 +802,41 @@ export class UserAgentObject {
     try {
       const body = (await request.json().catch(() => ({}))) as { name?: unknown };
       const name = typeof body.name === "string" && body.name.trim() ? body.name.trim() : undefined;
-      return Response.json(await this.getMcpStatusResponse({ name, force: true }));
+      return Response.json(await this.getMcpStatusResponse({
+        name,
+        force: true,
+        baseUrl: publicBaseUrl(request.url),
+      }));
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  private async handleStartMcpOAuth(request: Request) {
+    try {
+      const body = (await request.json().catch(() => ({}))) as { name?: unknown };
+      const name = typeof body.name === "string" && body.name.trim() ? body.name.trim() : "";
+      if (!name) throw new HttpError("MCP server name is required.", 400);
+      const result = await this.startMcpOAuth(name, publicBaseUrl(request.url));
+      return Response.json({ ok: true, ...result });
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  private async handleFinishMcpOAuth(url: URL) {
+    try {
+      const name = url.searchParams.get("server")?.trim() || "";
+      const code = url.searchParams.get("code")?.trim() || "";
+      const state = url.searchParams.get("state")?.trim() || "";
+      const error = url.searchParams.get("error")?.trim();
+      if (error) throw new HttpError(`MCP OAuth failed: ${error}`, 400);
+      if (!name || !code) throw new HttpError("MCP OAuth callback is missing server or code.", 400);
+      await this.finishMcpOAuth(name, code, state, publicBaseUrl(url.toString()));
+      return new Response(
+        "<!doctype html><meta charset=\"utf-8\"><title>MCP authorized</title><body>MCP server authorized. You can close this window.</body>",
+        { headers: { "Content-Type": "text/html; charset=utf-8" } },
+      );
     } catch (error) {
       return errorResponse(error);
     }
@@ -1016,7 +1150,10 @@ export class UserAgentObject {
         { role: "user", content: buildUserContent(payload.message, payload.attachments) },
       ],
       relevantMemories,
-      { skillGuidance: skillGuidance(configuredSkills) },
+      [
+        skillContextProvider(configuredSkills),
+        mcpContextProvider(this.getMcpSettings()),
+      ],
     );
 
     await callbacks.onMeta?.({
@@ -1053,6 +1190,10 @@ export class UserAgentObject {
     const toolExecutor = new ToolExecutor(registry, this.createToolContext(), {
       timeoutMs: DEFAULT_TOOL_TIMEOUT_MS,
       permissionEvaluator: (tool) => evaluateToolPermission(tool, this.getPermissionSettings()),
+      outputStore: this.createToolOutputStore({
+        source: options.source,
+        sessionId: options.sessionId,
+      }),
       approvalGate: {
         create: async ({ tool, input }) =>
           this.createPendingApproval(options.source, options.sessionId, tool, input),
@@ -1107,6 +1248,18 @@ export class UserAgentObject {
           name: toolCall.function.name,
           repeatedCallCount: guardrail.count,
           warning: guardrail.warning,
+        });
+        this.appendActivity({
+          type: "tool_call",
+          source: options.source,
+          sessionId: options.sessionId,
+          summary: `Tool call: ${toolCall.function.name}`,
+          data: {
+            id: toolCall.id,
+            name: toolCall.function.name,
+            repeatedCallCount: guardrail.count,
+            warning: guardrail.warning,
+          },
         });
 
         const preExecutionRecovery = this.preflightToolCall(
@@ -1200,6 +1353,17 @@ export class UserAgentObject {
           name: toolCall.function.name,
           result: effectiveToolResult,
           memoryCount: this.getMemoryCount(),
+        });
+        this.appendActivity({
+          type: extractToolError(effectiveToolResult) ? "tool_error" : "tool_result",
+          source: options.source,
+          sessionId: options.sessionId,
+          summary: `Tool finished: ${toolCall.function.name}`,
+          data: {
+            id: toolCall.id,
+            name: toolCall.function.name,
+            result: summarizeActivityData(effectiveToolResult),
+          },
         });
 
         if (recoveryDecision.content) {
@@ -1407,6 +1571,40 @@ export class UserAgentObject {
     this.ctx.storage.sql.exec(`
       CREATE INDEX IF NOT EXISTS tasks_due_idx
       ON tasks (status, due_at)
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS tool_outputs (
+        id TEXT PRIMARY KEY,
+        channel TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        session_id TEXT NOT NULL DEFAULT '',
+        tool_call_id TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        content TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE INDEX IF NOT EXISTS tool_outputs_created_idx
+      ON tool_outputs (created_at)
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS activity_log (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        channel TEXT,
+        chat_id TEXT,
+        session_id TEXT,
+        summary TEXT NOT NULL,
+        data_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE INDEX IF NOT EXISTS activity_log_created_idx
+      ON activity_log (created_at)
     `);
   }
 
@@ -1685,11 +1883,67 @@ export class UserAgentObject {
 
   private getMcpSettingsSummary() {
     const settings = this.getMcpSettings();
+    const oauth = this.getMcpOAuthSettings();
     const summary = mcpServerSummary(settings);
     return {
       serverCount: Object.keys(settings.servers).length,
       ...summary,
+      servers: summary.servers.map((server) => ({
+        ...server,
+        oauth: settings.servers[server.name]?.oauth
+          ? {
+              ...server.oauth,
+              ...summarizeMcpOAuthState(oauth.servers[server.name]),
+            }
+          : undefined,
+      })),
     };
+  }
+
+  private getMcpOAuthSettings(): McpOAuthSettings {
+    const row = this.query<RuntimeSettingRow>(
+      "SELECT key, value_json, updated_at FROM runtime_settings WHERE key = ? LIMIT 1",
+      MCP_OAUTH_SETTINGS_KEY,
+    )[0];
+    if (!row) return { servers: {} };
+
+    try {
+      return parseMcpOAuthSettingsPayload(JSON.parse(row.value_json));
+    } catch {
+      return { servers: {} };
+    }
+  }
+
+  private saveMcpOAuthSettings(settings: McpOAuthSettings) {
+    this.saveRuntimeSetting(MCP_OAUTH_SETTINGS_KEY, settings);
+  }
+
+  private pruneMcpOAuthSettings(settings: McpSettings) {
+    const current = this.getMcpOAuthSettings();
+    const servers = Object.fromEntries(
+      Object.entries(current.servers).filter(([name]) => settings.servers[name]?.oauth),
+    );
+    if (Object.keys(servers).length !== Object.keys(current.servers).length) {
+      this.saveMcpOAuthSettings({ servers });
+    }
+  }
+
+  private updateMcpOAuthState(
+    serverName: string,
+    update: (state: McpOAuthServerState) => McpOAuthServerState,
+  ) {
+    const current = this.getMcpOAuthSettings();
+    const nextState = update(current.servers[serverName] ?? {});
+    this.saveMcpOAuthSettings({
+      servers: {
+        ...current.servers,
+        [serverName]: {
+          ...nextState,
+          updatedAt: Date.now(),
+        },
+      },
+    });
+    return this.getMcpOAuthSettings().servers[serverName] ?? {};
   }
 
   private getPermissionSettings(): PermissionSettings {
@@ -1741,14 +1995,20 @@ export class UserAgentObject {
     const registry = createDefaultToolRegistry(this.env);
     const mcpSettings = this.getMcpSettings();
     const mcpSnapshots = await this.getMcpSnapshots({ force: false });
-    const mcpTools = createMcpToolDefinitionsFromSnapshots(mcpSettings, mcpSnapshots);
+    const mcpTools = createMcpToolDefinitionsFromSnapshots(mcpSettings, mcpSnapshots, {
+      authProviderFactory: (serverName, server) => this.createMcpOAuthProvider(serverName, server),
+    });
     for (const tool of mcpTools) {
       registry.register(tool);
     }
     return registry;
   }
 
-  private async getMcpStatusResponse(options: { force?: boolean; name?: string } = {}) {
+  private async getMcpStatusResponse(options: {
+    force?: boolean;
+    name?: string;
+    baseUrl?: string;
+  } = {}) {
     const settings = this.getMcpSettings();
     const snapshots = await this.getMcpSnapshots(options);
     return {
@@ -1772,7 +2032,7 @@ export class UserAgentObject {
     };
   }
 
-  private async getMcpSnapshots(options: { force?: boolean; name?: string } = {}) {
+  private async getMcpSnapshots(options: { force?: boolean; name?: string; baseUrl?: string } = {}) {
     const settings = this.getMcpSettings();
     const targetEntries = Object.entries(settings.servers).filter(([name]) =>
       options.name ? name === options.name : true,
@@ -1802,6 +2062,7 @@ export class UserAgentObject {
           };
         }
 
+        const previous = this.mcpSnapshots.get(serverName);
         const snapshot = await inspectMcpServer(
           serverName,
           server,
@@ -1809,8 +2070,16 @@ export class UserAgentObject {
           {
             defaultTimeoutMs: settings.defaultTimeoutMs,
             ttlMs: MCP_TOOL_CACHE_TTL_MS,
+            authProvider: this.createMcpOAuthProvider(serverName, server, options.baseUrl),
+            oauthStatus: this.getMcpOAuthStatus(serverName, server),
+            onActivity: (event) => this.appendActivity({
+              type: event.type,
+              summary: event.message,
+              data: event.data,
+            }),
           },
         );
+        this.recordMcpCatalogChange(previous, snapshot);
         this.mcpSnapshots.set(serverName, snapshot);
         return snapshot;
       }),
@@ -1825,6 +2094,175 @@ export class UserAgentObject {
       return;
     }
     this.mcpSnapshots.clear();
+  }
+
+  private getMcpOAuthStatus(serverName: string, server: RemoteMcpServer) {
+    if (!server.oauth) return undefined;
+    return {
+      enabled: true,
+      ...summarizeMcpOAuthState(this.getMcpOAuthSettings().servers[serverName]),
+    };
+  }
+
+  private createMcpOAuthProvider(
+    serverName: string,
+    server: RemoteMcpServer,
+    baseUrl?: string,
+  ): OAuthClientProvider | undefined {
+    if (!server.oauth) return undefined;
+    const redirectUrl = server.oauth.redirectUri
+      ?? `${baseUrl ?? "https://agent.invalid"}/api/agent/settings/mcp/oauth/callback?server=${encodeURIComponent(serverName)}`;
+    const metadata: OAuthClientMetadata = {
+      client_name: "Agent Worker",
+      redirect_uris: [redirectUrl],
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: server.oauth.clientSecret ? "client_secret_post" : "none",
+      ...(server.oauth.scope ? { scope: server.oauth.scope } : {}),
+    };
+
+    const load = () => this.getMcpOAuthSettings().servers[serverName] ?? {};
+    const update = (patch: Partial<McpOAuthServerState>) =>
+      this.updateMcpOAuthState(serverName, (state) => ({ ...state, ...patch }));
+    const clear = (...keys: Array<keyof McpOAuthServerState>) =>
+      this.updateMcpOAuthState(serverName, (state) => {
+        const next = { ...state };
+        for (const key of keys) delete next[key];
+        return next;
+      });
+
+    return {
+      get redirectUrl() {
+        return redirectUrl;
+      },
+      clientMetadataUrl: server.oauth.clientMetadataUrl,
+      get clientMetadata() {
+        return metadata;
+      },
+      state: async () => {
+        const state = crypto.randomUUID();
+        update({ state });
+        return state;
+      },
+      clientInformation: () =>
+        asOAuthClientInformation(load().clientInformation)
+        ?? (server.oauth?.clientId
+          ? {
+              client_id: server.oauth.clientId,
+              ...(server.oauth.clientSecret ? { client_secret: server.oauth.clientSecret } : {}),
+            }
+          : undefined),
+      saveClientInformation: (clientInformation: OAuthClientInformationMixed) => {
+        update({ clientInformation: jsonClone(clientInformation) });
+      },
+      tokens: () => asOAuthTokens(load().tokens),
+      saveTokens: (tokens: OAuthTokens) => {
+        update({
+          tokens: jsonClone(tokens),
+          authorizationUrl: undefined,
+          state: undefined,
+        });
+      },
+      redirectToAuthorization: (authorizationUrl: URL) => {
+        update({ authorizationUrl: authorizationUrl.toString() });
+      },
+      saveCodeVerifier: (codeVerifier: string) => {
+        update({ codeVerifier });
+      },
+      codeVerifier: () => {
+        const verifier = load().codeVerifier;
+        if (!verifier) throw new Error("No MCP OAuth code verifier saved.");
+        return verifier;
+      },
+      saveDiscoveryState: (state: OAuthDiscoveryState) => {
+        update({ discoveryState: jsonClone(state) as unknown as Record<string, unknown> });
+      },
+      discoveryState: () => asOAuthDiscoveryState(load().discoveryState),
+      invalidateCredentials: (scope) => {
+        if (scope === "all") {
+          clear("clientInformation", "tokens", "codeVerifier", "state", "authorizationUrl", "discoveryState");
+        } else if (scope === "client") {
+          clear("clientInformation");
+        } else if (scope === "tokens") {
+          clear("tokens");
+        } else if (scope === "verifier") {
+          clear("codeVerifier", "state", "authorizationUrl");
+        } else if (scope === "discovery") {
+          clear("discoveryState");
+        }
+      },
+    };
+  }
+
+  private async startMcpOAuth(serverName: string, baseUrl: string) {
+    const server = this.requireMcpServer(serverName);
+    if (!server.oauth) throw new HttpError(`MCP server ${serverName} does not have oauth enabled.`, 400);
+    const provider = this.createMcpOAuthProvider(serverName, server, baseUrl);
+    if (!provider) throw new HttpError("MCP OAuth provider is not available.", 400);
+    const result = await auth(provider, {
+      serverUrl: server.url,
+      fetchFn: (input, init) => fetch(input, init),
+    });
+    const state = this.getMcpOAuthSettings().servers[serverName];
+    this.appendActivity({
+      type: "mcp_oauth_start",
+      summary: result === "AUTHORIZED"
+        ? `MCP OAuth already authorized: ${serverName}`
+        : `MCP OAuth authorization started: ${serverName}`,
+      data: { serverName, result },
+    });
+    return {
+      server: serverName,
+      authorized: result === "AUTHORIZED",
+      authorizationUrl: state?.authorizationUrl,
+    };
+  }
+
+  private async finishMcpOAuth(serverName: string, code: string, state: string, baseUrl: string) {
+    const server = this.requireMcpServer(serverName);
+    if (!server.oauth) throw new HttpError(`MCP server ${serverName} does not have oauth enabled.`, 400);
+    const stored = this.getMcpOAuthSettings().servers[serverName];
+    if (stored?.state && state && stored.state !== state) {
+      throw new HttpError("MCP OAuth state mismatch.", 400);
+    }
+    const provider = this.createMcpOAuthProvider(serverName, server, baseUrl);
+    if (!provider) throw new HttpError("MCP OAuth provider is not available.", 400);
+    await auth(provider, {
+      serverUrl: server.url,
+      authorizationCode: code,
+      fetchFn: (input, init) => fetch(input, init),
+    });
+    this.updateMcpOAuthState(serverName, (current) => ({
+      ...current,
+      authorizationUrl: undefined,
+      state: undefined,
+    }));
+    this.invalidateMcpSnapshots(serverName);
+    this.appendActivity({
+      type: "mcp_oauth_finish",
+      summary: `MCP OAuth authorized: ${serverName}`,
+      data: { serverName },
+    });
+  }
+
+  private recordMcpCatalogChange(
+    previous: McpServerSnapshot | undefined,
+    next: McpServerSnapshot,
+  ) {
+    if (!previous || previous.status.status !== "connected" || next.status.status !== "connected") return;
+    const before = mcpCatalogSignature(previous);
+    const after = mcpCatalogSignature(next);
+    if (before === after) return;
+    this.appendActivity({
+      type: "mcp_catalog_changed",
+      summary: `MCP catalog changed: ${next.serverName}`,
+      data: {
+        serverName: next.serverName,
+        tools: next.tools.length,
+        prompts: next.prompts.length,
+        resources: next.resources.length,
+      },
+    });
   }
 
   private requireMcpServer(name: string): RemoteMcpServer {
@@ -2361,7 +2799,7 @@ export class UserAgentObject {
 
   private async approvePendingTool(
     approvalId: string,
-    payload: { source?: ChannelSource; llm?: LlmConfig },
+    payload: { source?: ChannelSource; llm?: LlmConfig; approvalMode?: "once" | "always" },
     callbacks: AgentCallbacks,
   ) {
     const approval = this.getPendingApproval(approvalId);
@@ -2372,6 +2810,16 @@ export class UserAgentObject {
     if (approval.expires_at <= Date.now()) {
       this.deletePendingApproval(approval.id);
       throw new HttpError("Approval expired.", 410);
+    }
+    if (payload.approvalMode === "always") {
+      this.rememberToolPermission(approval.toolName, "allow");
+      this.appendActivity({
+        type: "permission_allow",
+        source: payload.source ?? { channel: approval.channel, chatId: approval.chatId },
+        sessionId: approval.sessionId,
+        summary: `Always allowed tool: ${approval.toolName}`,
+        data: { approvalId: approval.id, toolName: approval.toolName },
+      });
     }
 
     const runSource = payload.source ?? {
@@ -2403,7 +2851,7 @@ export class UserAgentObject {
 
   private async runApprovedTool(
     approval: PendingToolApproval,
-    payload: { source?: ChannelSource; llm?: LlmConfig },
+    payload: { source?: ChannelSource; llm?: LlmConfig; approvalMode?: "once" | "always" },
     callbacks: AgentCallbacks,
     activeRun: ActiveRunRecord,
   ) {
@@ -2415,9 +2863,14 @@ export class UserAgentObject {
     const registry = await this.createToolRegistry();
     const toolExecutor = new ToolExecutor(registry, this.createToolContext(), {
       timeoutMs: DEFAULT_TOOL_TIMEOUT_MS,
+      outputStore: this.createToolOutputStore({
+        source: payload.source ?? { channel: approval.channel, chatId: approval.chatId },
+        sessionId: approval.sessionId,
+      }),
     });
     const execution = await toolExecutor.executeStoredTool(approval.toolName, approval.toolInput, {
       bypassApproval: true,
+      toolCallId: approval.id,
     });
     const toolResult =
       execution.status === "executed"
@@ -2430,6 +2883,17 @@ export class UserAgentObject {
       name: approval.toolName,
       result: toolResult,
       memoryCount: this.getMemoryCount(),
+    });
+    this.appendActivity({
+      type: extractToolError(toolResult) ? "tool_error" : "tool_result",
+      source: payload.source ?? { channel: approval.channel, chatId: approval.chatId },
+      sessionId: approval.sessionId,
+      summary: `Approved tool finished: ${approval.toolName}`,
+      data: {
+        approvalId: approval.id,
+        toolName: approval.toolName,
+        result: summarizeActivityData(toolResult),
+      },
     });
 
     if (paused) {
@@ -2756,6 +3220,14 @@ export class UserAgentObject {
     return `m_${crypto.randomUUID()}`;
   }
 
+  private createToolOutputId() {
+    return `out_${crypto.randomUUID()}`;
+  }
+
+  private createActivityId() {
+    return `act_${crypto.randomUUID()}`;
+  }
+
   private createToolContext(): ToolContext {
     return {
       fetch: (input, init) => fetch(input, init),
@@ -2781,18 +3253,20 @@ export class UserAgentObject {
         delete: async (name) => this.deleteSkill(name),
       },
       mcp: {
-        status: async () => this.getMcpStatusResponse(),
+        status: async (name) => this.getMcpStatusResponse({ name }),
         refresh: async (name) => this.getMcpStatusResponse({ force: true, name }),
         upsertPublicServer: async (server) => {
           const current = this.getMcpSettings();
           current.servers[server.name] = {
             type: "remote",
             url: server.url,
-            headers: undefined,
+            headers: server.headers,
+            oauth: server.oauth,
             disabled: server.disabled ?? false,
             timeoutMs: server.timeoutMs,
           };
           this.saveRuntimeSetting(MCP_SETTINGS_KEY, current);
+          this.pruneMcpOAuthSettings(current);
           this.invalidateMcpSnapshots(server.name);
         },
         deleteServer: async (name) => {
@@ -2800,6 +3274,7 @@ export class UserAgentObject {
           const existed = current.servers[name] !== undefined;
           delete current.servers[name];
           this.saveRuntimeSetting(MCP_SETTINGS_KEY, current);
+          this.pruneMcpOAuthSettings(current);
           this.invalidateMcpSnapshots(name);
           return existed;
         },
@@ -2811,6 +3286,7 @@ export class UserAgentObject {
             args,
             (input, init) => fetch(input, init),
             this.getMcpSettings().defaultTimeoutMs,
+            this.createMcpOAuthProvider(server, this.requireMcpServer(server)),
           ),
         listResources: async (server) => this.listMcpResources(server),
         readResource: async (server, uri) =>
@@ -2819,6 +3295,7 @@ export class UserAgentObject {
             uri,
             (input, init) => fetch(input, init),
             this.getMcpSettings().defaultTimeoutMs,
+            this.createMcpOAuthProvider(server, this.requireMcpServer(server)),
           ),
       },
     };
@@ -2881,6 +3358,175 @@ export class UserAgentObject {
         })),
       ),
     };
+  }
+
+  private createToolOutputStore(context: ToolOutputContext) {
+    return {
+      bound: async (request: {
+        tool: ToolDefinition;
+        toolCallId?: string;
+        result: unknown;
+      }) => {
+        const maxResultChars = request.tool.maxResultChars;
+        if (!maxResultChars || maxResultChars <= 0) return request.result;
+
+        const text = stringifyToolOutput(request.result);
+        if (text.length <= maxResultChars) return request.result;
+
+        const now = Date.now();
+        const source = normalizeSource(context.source);
+        const stored = truncateStoredText(text, MAX_TOOL_OUTPUT_CHARS);
+        const output = {
+          id: this.createToolOutputId(),
+          channel: source.channel,
+          chatId: source.chatId,
+          sessionId: context.sessionId ?? "",
+          toolCallId: request.toolCallId ?? "",
+          toolName: request.tool.name,
+          content: stored.content,
+          size: text.length,
+          created_at: now,
+          expires_at: now + TOOL_OUTPUT_TTL_MS,
+        };
+
+        this.ctx.storage.sql.exec(
+          `
+            INSERT INTO tool_outputs
+              (id, channel, chat_id, session_id, tool_call_id, tool_name, content, size, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `,
+          output.id,
+          output.channel,
+          output.chatId,
+          output.sessionId,
+          output.toolCallId,
+          output.toolName,
+          output.content,
+          output.size,
+          output.created_at,
+          output.expires_at,
+        );
+        this.pruneToolOutputs();
+
+        return {
+          truncated: true,
+          artifact: true,
+          toolName: request.tool.name,
+          maxResultChars,
+          preview: text.slice(0, maxResultChars),
+          outputId: output.id,
+          outputUrl: `/api/agent/tool-outputs/${encodeURIComponent(output.id)}`,
+          size: output.size,
+          storedSize: output.content.length,
+          storedTruncated: stored.truncated,
+          expiresAt: output.expires_at,
+        };
+      },
+    };
+  }
+
+  private getToolOutputs(options: { limit: number }) {
+    this.pruneToolOutputs();
+    const limit = clampLimit(options.limit, 1, MAX_TOOL_OUTPUT_ROWS);
+    return this.query<Omit<ToolOutputRow, "content">>(
+      `
+        SELECT id, channel, chat_id, session_id, tool_call_id, tool_name, size, created_at, expires_at
+        FROM tool_outputs
+        WHERE expires_at > ?
+        ORDER BY created_at DESC
+        LIMIT ?
+      `,
+      Date.now(),
+      limit,
+    ).map(rowToToolOutputSummary);
+  }
+
+  private getToolOutput(id: string) {
+    if (!id) return null;
+    this.pruneToolOutputs();
+    const row = this.query<ToolOutputRow>(
+      `
+        SELECT id, channel, chat_id, session_id, tool_call_id, tool_name, content, size, created_at, expires_at
+        FROM tool_outputs
+        WHERE id = ? AND expires_at > ?
+        LIMIT 1
+      `,
+      id,
+      Date.now(),
+    )[0];
+    return row ? rowToToolOutput(row) : null;
+  }
+
+  private pruneToolOutputs() {
+    this.ctx.storage.sql.exec("DELETE FROM tool_outputs WHERE expires_at <= ?", Date.now());
+    const overflow = this.query<{ id: string }>(
+      "SELECT id FROM tool_outputs ORDER BY created_at DESC",
+    ).slice(MAX_TOOL_OUTPUT_ROWS);
+
+    for (const row of overflow) {
+      this.ctx.storage.sql.exec("DELETE FROM tool_outputs WHERE id = ?", row.id);
+    }
+  }
+
+  private appendActivity(input: {
+    type: string;
+    source?: ChannelSource;
+    sessionId?: string;
+    summary: string;
+    data?: unknown;
+  }) {
+    const source = input.source ? normalizeSource(input.source) : undefined;
+    const data = truncateStoredText(stringifyToolOutput(input.data ?? {}), MAX_ACTIVITY_DATA_CHARS);
+    this.ctx.storage.sql.exec(
+      `
+        INSERT INTO activity_log
+          (id, type, channel, chat_id, session_id, summary, data_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      this.createActivityId(),
+      compactText(input.type, 80),
+      source?.channel ?? null,
+      source?.chatId ?? null,
+      input.sessionId ?? null,
+      compactText(input.summary, 500),
+      data.content,
+      Date.now(),
+    );
+    this.pruneActivityLog();
+  }
+
+  private getActivityLog(options: { limit: number }) {
+    const limit = clampLimit(options.limit, 1, MAX_ACTIVITY_ROWS);
+    return this.query<ActivityRow>(
+      `
+        SELECT id, type, channel, chat_id, session_id, summary, data_json, created_at
+        FROM activity_log
+        ORDER BY created_at DESC
+        LIMIT ?
+      `,
+      limit,
+    ).map(rowToActivity);
+  }
+
+  private pruneActivityLog() {
+    const overflow = this.query<{ id: string }>(
+      "SELECT id FROM activity_log ORDER BY created_at DESC",
+    ).slice(MAX_ACTIVITY_ROWS);
+
+    for (const row of overflow) {
+      this.ctx.storage.sql.exec("DELETE FROM activity_log WHERE id = ?", row.id);
+    }
+  }
+
+  private rememberToolPermission(toolName: string, action: "allow" | "deny") {
+    const current = this.getPermissionSettings();
+    const next = parsePermissionSettingsPayload({
+      rules: [
+        ...current.rules.filter((rule) => !(rule.tool === toolName && rule.action === action)),
+        { tool: toolName, action },
+      ].slice(-100),
+    });
+    this.saveRuntimeSetting(PERMISSION_SETTINGS_KEY, next);
   }
 
   private saveSkillSettings(settings: SkillSettings) {
@@ -2963,6 +3609,41 @@ function rowToChatSession(row: ChatSessionRow): StoredChatSession {
   };
 }
 
+function rowToToolOutputSummary(row: Omit<ToolOutputRow, "content">) {
+  return {
+    id: row.id,
+    channel: row.channel,
+    chatId: row.chat_id,
+    sessionId: row.session_id || undefined,
+    toolCallId: row.tool_call_id,
+    toolName: row.tool_name,
+    size: row.size,
+    outputUrl: `/api/agent/tool-outputs/${encodeURIComponent(row.id)}`,
+    created_at: row.created_at,
+    expires_at: row.expires_at,
+  };
+}
+
+function rowToToolOutput(row: ToolOutputRow) {
+  return {
+    ...rowToToolOutputSummary(row),
+    content: row.content,
+  };
+}
+
+function rowToActivity(row: ActivityRow) {
+  return {
+    id: row.id,
+    type: row.type,
+    channel: row.channel ?? undefined,
+    chatId: row.chat_id ?? undefined,
+    sessionId: row.session_id ?? undefined,
+    summary: row.summary,
+    data: parseStoredJson(row.data_json),
+    created_at: row.created_at,
+  };
+}
+
 function parseStoredJson(value: string) {
   try {
     return JSON.parse(value) as unknown;
@@ -2978,6 +3659,71 @@ function summarizeMcpCatalogItem(item: Record<string, unknown>) {
     description: typeof item.description === "string" ? item.description : undefined,
     mimeType: typeof item.mimeType === "string" ? item.mimeType : undefined,
   };
+}
+
+function mcpCatalogSignature(snapshot: McpServerSnapshot) {
+  return stableJsonStringify({
+    tools: snapshot.tools.map((tool) => tool.name).sort(),
+    prompts: snapshot.prompts.map(summarizeMcpCatalogItem).sort(compareCatalogItems),
+    resources: snapshot.resources.map(summarizeMcpCatalogItem).sort(compareCatalogItems),
+  });
+}
+
+function compareCatalogItems(
+  left: ReturnType<typeof summarizeMcpCatalogItem>,
+  right: ReturnType<typeof summarizeMcpCatalogItem>,
+) {
+  return `${left.name ?? ""}:${left.uri ?? ""}`.localeCompare(`${right.name ?? ""}:${right.uri ?? ""}`);
+}
+
+function publicBaseUrl(requestUrl: string) {
+  const url = new URL(requestUrl);
+  return url.origin;
+}
+
+function parseLimit(value: string | null, fallback: number, max: number) {
+  if (!value) return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return clampLimit(parsed, 1, max);
+}
+
+function clampLimit(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, Math.floor(value)));
+}
+
+function jsonClone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function summarizeActivityData(value: unknown) {
+  if (typeof value === "string") return compactText(value, 1_000);
+  const text = stringifyToolOutput(value);
+  if (text.length <= 1_000) return value;
+  return `${text.slice(0, 1_000)}\n[truncated]`;
+}
+
+function stringifyToolOutput(value: unknown) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function truncateStoredText(value: string, maxChars: number) {
+  if (value.length <= maxChars) return { content: value, truncated: false };
+  return {
+    content: `${value.slice(0, maxChars)}\n[stored output truncated]`,
+    truncated: true,
+  };
+}
+
+function compactText(value: string, maxChars: number) {
+  const compacted = value.replace(/\s+/g, " ").trim();
+  if (compacted.length <= maxChars) return compacted;
+  return `${compacted.slice(0, Math.max(0, maxChars - 3))}...`;
 }
 
 function formatApprovalRequiredMessage(approval: PendingToolApproval) {

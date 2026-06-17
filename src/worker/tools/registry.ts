@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { RemoteMcpServer } from "../mcp/settings";
 import type { SkillDefinition } from "../skills/settings";
 import type { Env } from "../types";
 
@@ -28,11 +29,13 @@ export interface ToolContext {
     delete: (name: string) => Promise<boolean>;
   };
   mcp?: {
-    status: () => Promise<unknown>;
+    status: (name?: string) => Promise<unknown>;
     refresh: (name?: string) => Promise<unknown>;
     upsertPublicServer: (server: {
       name: string;
       url: string;
+      headers?: RemoteMcpServer["headers"];
+      oauth?: RemoteMcpServer["oauth"];
       disabled?: boolean;
       timeoutMs?: number;
     }) => Promise<void>;

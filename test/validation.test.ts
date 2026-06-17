@@ -88,6 +88,7 @@ describe("validation", () => {
       }),
     ).toEqual({
       source: { channel: "telegram", chatId: "123" },
+      approvalMode: "once",
     });
   });
 });

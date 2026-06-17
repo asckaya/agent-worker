@@ -138,7 +138,7 @@ export const getMcpStatusTool: ToolDefinition<z.infer<typeof OptionalMcpServerIn
   risk: "read",
   requiresApproval: false,
   toolset: "mcp",
-  execute: async (ctx) => requireMcp(ctx).status(),
+  execute: async (ctx, input) => requireMcp(ctx).status(input.name),
 };
 
 export const refreshMcpToolsTool: ToolDefinition<z.infer<typeof OptionalMcpServerInputSchema>, unknown> = {
@@ -154,10 +154,49 @@ export const refreshMcpToolsTool: ToolDefinition<z.infer<typeof OptionalMcpServe
 export const upsertMcpServerTool: ToolDefinition<z.infer<typeof PublicMcpServerUpdateSchema>, unknown> = {
   name: "upsert_mcp_server",
   description: [
-    "Create or update a SQL-backed remote MCP server using a public HTTP/HTTPS endpoint.",
-    "This tool cannot set authorization headers or tokens; configure secret headers from the protected status page.",
+    "Create or update a SQL-backed remote MCP server.",
+    "Supports name, url, headers, oauth, disabled, and timeoutMs. MCP tools are available after refresh_mcp_tools succeeds.",
   ].join("\n"),
   inputSchema: PublicMcpServerUpdateSchema,
+  modelParameters: {
+    type: "object",
+    additionalProperties: false,
+    required: ["name", "url"],
+    properties: {
+      name: {
+        type: "string",
+        description: "Stable MCP server name using letters, numbers, underscores, or hyphens.",
+      },
+      url: {
+        type: "string",
+        description: "HTTP or HTTPS MCP endpoint URL.",
+      },
+      headers: {
+        type: "object",
+        additionalProperties: { type: "string" },
+        description: "Optional request headers for the MCP server.",
+      },
+      oauth: {
+        anyOf: [
+          { type: "boolean" },
+          {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              enabled: { type: "boolean" },
+              clientId: { type: "string" },
+              clientSecret: { type: "string" },
+              scope: { type: "string" },
+              redirectUri: { type: "string" },
+              clientMetadataUrl: { type: "string" },
+            },
+          },
+        ],
+      },
+      disabled: { type: "boolean" },
+      timeoutMs: { type: "integer", minimum: 1000, maximum: 60000 },
+    },
+  },
   risk: "external",
   requiresApproval: true,
   toolset: "mcp",

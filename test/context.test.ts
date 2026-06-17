@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildClientHistoryMessages, buildModelMessages } from "../src/worker/agent/context";
+import { contextProvider } from "../src/worker/agent/context-providers";
 
 describe("agent context", () => {
   it("keeps only valid browser history messages", () => {
@@ -32,12 +33,17 @@ describe("agent context", () => {
     const messages = buildModelMessages(
       [{ role: "user", content: "Plan this" }],
       [],
-      { skillGuidance: "<available_skills><skill><name>planning</name></skill></available_skills>" },
+      [
+        contextProvider(
+          "skills",
+          () => "<available_skills><skill><name>planning</name></skill></available_skills>",
+        ),
+      ],
     );
 
     expect(messages[1]).toEqual({
       role: "system",
-      content: "<available_skills><skill><name>planning</name></skill></available_skills>",
+      content: "<context source=\"skills\">\n<available_skills><skill><name>planning</name></skill></available_skills>\n</context>",
     });
     expect(messages.at(-1)).toEqual({ role: "user", content: "Plan this" });
   });

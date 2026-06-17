@@ -80,6 +80,7 @@ export const ChannelSourceSchema = z.object({
 export const ApprovalActionRequestSchema = z.object({
   source: ChannelSourceSchema.optional(),
   llm: LlmConfigSchema.optional(),
+  approvalMode: z.enum(["once", "always"]).optional().default("once"),
 });
 
 export const SessionControlRequestSchema = z.object({
@@ -203,6 +204,7 @@ export function parseChatRequestPayload(payload: unknown): ChatRequest {
 export function parseApprovalActionPayload(payload: unknown): {
   source?: ChannelSource;
   llm?: LlmConfig;
+  approvalMode: "once" | "always";
 } {
   const result = ApprovalActionRequestSchema.safeParse(payload);
   if (!result.success) {

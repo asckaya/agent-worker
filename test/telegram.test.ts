@@ -456,8 +456,12 @@ describe("telegram integration", () => {
             inline_keyboard: [
               [
                 {
-                  text: "Approve",
+                  text: "Approve once",
                   callback_data: "agent-worker:approve:ap1",
+                },
+                {
+                  text: "Always allow",
+                  callback_data: "agent-worker:always:ap1",
                 },
                 {
                   text: "Deny",
@@ -517,6 +521,7 @@ describe("telegram integration", () => {
     expect(agentPath).toBe("/approvals/ap1/approve-stream");
     expect(agentRequestBody).toEqual({
       source: { channel: "telegram", chatId: "123" },
+      approvalMode: "once",
       llm: {
         baseUrl: "https://api.openai.com/v1",
         apiKey: "key",

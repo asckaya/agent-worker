@@ -30,11 +30,22 @@ interface SkillSettings {
 interface McpStatusServer {
   name: string;
   url: string;
-  status: "connected" | "disabled" | "failed";
+  status: "connected" | "disabled" | "failed" | "needs_auth";
   cached?: boolean;
   transport?: string;
   error?: string;
   headerNames?: string[];
+  oauth?: {
+    enabled: boolean;
+    authorized: boolean;
+    authorizationUrl?: string;
+    updatedAt?: number;
+  };
+  listChanged?: {
+    tools?: boolean;
+    prompts?: boolean;
+    resources?: boolean;
+  };
   toolCount?: number;
   promptCount?: number;
   resourceCount?: number;
@@ -53,6 +64,30 @@ interface RuntimeSettingsResponse {
 
 interface McpStatusResponse {
   servers?: McpStatusServer[];
+}
+
+interface ActivityEvent {
+  id: string;
+  type: string;
+  channel?: string;
+  chatId?: string;
+  sessionId?: string;
+  summary: string;
+  data?: unknown;
+  created_at: number;
+}
+
+interface ToolOutputSummary {
+  id: string;
+  channel: string;
+  chatId: string;
+  sessionId?: string;
+  toolCallId: string;
+  toolName: string;
+  size: number;
+  outputUrl: string;
+  created_at: number;
+  expires_at: number;
 }
 
 const checks = [
@@ -93,7 +128,10 @@ function App() {
   const [skills, setSkills] = useState<SkillSummary[]>([]);
   const [mcpText, setMcpText] = useState('{\n  "servers": {}\n}');
   const [mcpStatus, setMcpStatus] = useState<McpStatusServer[]>([]);
+  const [oauthLinks, setOauthLinks] = useState<Record<string, string>>({});
   const [permissionText, setPermissionText] = useState('{\n  "rules": []\n}');
+  const [activity, setActivity] = useState<ActivityEvent[]>([]);
+  const [toolOutputs, setToolOutputs] = useState<ToolOutputSummary[]>([]);
   const [configStatus, setConfigStatus] = useState("Not loaded");
 
   useEffect(() => {
@@ -163,9 +201,11 @@ function App() {
   async function loadConfig() {
     setConfigStatus("Loading...");
     try {
-      const [runtime, mcp] = await Promise.all([
+      const [runtime, mcp, activityResponse, outputResponse] = await Promise.all([
         fetchJson<RuntimeSettingsResponse>("/api/agent/settings/runtime"),
         fetchJson<McpStatusResponse>("/api/agent/settings/mcp/status").catch(() => ({ servers: [] })),
+        fetchJson<{ events?: ActivityEvent[] }>("/api/agent/activity?limit=20").catch(() => ({ events: [] })),
+        fetchJson<{ outputs?: ToolOutputSummary[] }>("/api/agent/tool-outputs?limit=20").catch(() => ({ outputs: [] })),
       ]);
       const skillSettings = runtime.settings?.skills ?? {};
       setSkills(skillSettings.skills ?? []);
@@ -175,6 +215,8 @@ function App() {
       setMcpText(JSON.stringify(runtime.settings?.mcp ?? { servers: {} }, null, 2));
       setPermissionText(JSON.stringify(runtime.settings?.permissions ?? { rules: [] }, null, 2));
       setMcpStatus(mcp.servers ?? []);
+      setActivity(activityResponse.events ?? []);
+      setToolOutputs(outputResponse.outputs ?? []);
       setConfigStatus("Loaded");
     } catch (error) {
       setConfigStatus(error instanceof Error ? error.message : "Load failed");
@@ -271,6 +313,29 @@ function App() {
       setConfigStatus("MCP status refreshed");
     } catch (error) {
       setConfigStatus(error instanceof Error ? error.message : "MCP test failed");
+    }
+  }
+
+  async function startMcpOAuth(name: string) {
+    setConfigStatus(`Starting OAuth for ${name}...`);
+    try {
+      const response = await fetchJson<{
+        authorized?: boolean;
+        authorizationUrl?: string;
+      }>("/api/agent/settings/mcp/oauth/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      if (response.authorizationUrl) {
+        setOauthLinks((current) => ({ ...current, [name]: response.authorizationUrl ?? "" }));
+        setConfigStatus(`OAuth link ready for ${name}`);
+      } else {
+        setConfigStatus(response.authorized ? `${name} is already authorized` : `OAuth started for ${name}`);
+      }
+      await refreshMcpStatus();
+    } catch (error) {
+      setConfigStatus(error instanceof Error ? error.message : "OAuth start failed");
     }
   }
 
@@ -515,6 +580,34 @@ function App() {
                       {server.headerNames?.length ? (
                         <small>Headers: {server.headerNames.join(", ")}</small>
                       ) : null}
+                      {server.oauth?.enabled ? (
+                        <div className="oauth-row">
+                          <span>{server.oauth.authorized ? "OAuth authorized" : "OAuth required"}</span>
+                          <button type="button" onClick={() => void startMcpOAuth(server.name)}>
+                            Start OAuth
+                          </button>
+                          {server.oauth.authorizationUrl || oauthLinks[server.name] ? (
+                            <a
+                              className="link-button"
+                              href={server.oauth.authorizationUrl ?? oauthLinks[server.name]}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              Authorize
+                            </a>
+                          ) : null}
+                        </div>
+                      ) : null}
+                      {server.listChanged &&
+                      (server.listChanged.tools || server.listChanged.prompts || server.listChanged.resources) ? (
+                        <small>
+                          List change notifications: {[
+                            server.listChanged.tools ? "tools" : "",
+                            server.listChanged.prompts ? "prompts" : "",
+                            server.listChanged.resources ? "resources" : "",
+                          ].filter(Boolean).join(", ")}
+                        </small>
+                      ) : null}
                       {server.error ? <p>{server.error}</p> : null}
                       {server.tools?.length ? (
                         <div className="catalog-list">
@@ -550,6 +643,59 @@ function App() {
                 onChange={(event) => setPermissionText(event.target.value)}
               />
             </article>
+
+            <article className="config-editor span-wide">
+              <header>
+                <div>
+                  <h3>Activity</h3>
+                  <small>{activity.length} recent events</small>
+                </div>
+                <button type="button" onClick={() => void loadConfig()}>
+                  Refresh
+                </button>
+              </header>
+              <div className="activity-list">
+                {activity.length === 0 ? (
+                  <p>No recent activity.</p>
+                ) : (
+                  activity.map((event) => (
+                    <section key={event.id}>
+                      <div>
+                        <strong>{event.type}</strong>
+                        <span>{formatTime(event.created_at)}</span>
+                      </div>
+                      <p>{event.summary}</p>
+                      {event.channel ? <small>{event.channel}:{event.chatId ?? "default"}</small> : null}
+                      {event.data ? <code>{stringifyShort(event.data, 360)}</code> : null}
+                    </section>
+                  ))
+                )}
+              </div>
+            </article>
+
+            <article className="config-editor">
+              <header>
+                <div>
+                  <h3>Tool Outputs</h3>
+                  <small>{toolOutputs.length} stored artifacts</small>
+                </div>
+              </header>
+              <div className="artifact-list">
+                {toolOutputs.length === 0 ? (
+                  <p>No stored tool outputs.</p>
+                ) : (
+                  toolOutputs.map((output) => (
+                    <section key={output.id}>
+                      <strong>{output.toolName}</strong>
+                      <span>{formatBytes(output.size)} / expires {formatTime(output.expires_at)}</span>
+                      <a href={output.outputUrl} target="_blank" rel="noreferrer">
+                        Open output
+                      </a>
+                    </section>
+                  ))
+                )}
+              </div>
+            </article>
           </div>
         )}
       </section>
@@ -583,4 +729,19 @@ function parseSkillSourceText(value: string) {
 
 function normalizeSkillSources(values: string[]) {
   return [...new Set(values.flatMap(parseSkillSourceText))];
+}
+
+function formatTime(value: number) {
+  return new Date(value).toLocaleString();
+}
+
+function formatBytes(value: number) {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function stringifyShort(value: unknown, maxChars: number) {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  return text.length > maxChars ? `${text.slice(0, maxChars - 3)}...` : text;
 }

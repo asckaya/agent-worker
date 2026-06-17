@@ -1,8 +1,10 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { type OAuthClientProvider, UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
   CallToolResultSchema,
+  LoggingMessageNotificationSchema,
   type Tool as McpToolDefinition,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
@@ -16,7 +18,14 @@ const MAX_LIST_PAGES = 100;
 const MAX_MCP_RESULT_CHARS = 12_000;
 
 export type McpTransportName = "streamable-http" | "sse";
-export type McpServerStatusName = "connected" | "disabled" | "failed";
+export type McpServerStatusName = "connected" | "disabled" | "failed" | "needs_auth";
+
+export interface McpActivityEvent {
+  type: "mcp_server_log" | "mcp_catalog_changed";
+  serverName: string;
+  message: string;
+  data?: Record<string, unknown>;
+}
 
 export interface McpServerStatus {
   name: string;
@@ -26,10 +35,21 @@ export interface McpServerStatus {
   checkedAt: number;
   cached: boolean;
   headerNames: string[];
+  oauth?: {
+    enabled: boolean;
+    authorized: boolean;
+    authorizationUrl?: string;
+    updatedAt?: number;
+  };
   transport?: McpTransportName;
   toolCount?: number;
   promptCount?: number;
   resourceCount?: number;
+  listChanged?: {
+    tools?: boolean;
+    prompts?: boolean;
+    resources?: boolean;
+  };
   error?: string;
 }
 
@@ -51,12 +71,26 @@ interface FormattedMcpContentResult {
   metadata?: Record<string, unknown>;
 }
 
+interface McpClientOptions {
+  defaultTimeoutMs?: number;
+  ttlMs?: number;
+  authProvider?: OAuthClientProvider;
+  oauthStatus?: McpServerStatus["oauth"];
+  onActivity?: (event: McpActivityEvent) => void;
+  serverName?: string;
+}
+
+interface McpToolDefinitionOptions {
+  authProviderFactory?: (serverName: string, server: RemoteMcpServer) => OAuthClientProvider | undefined;
+}
+
 export async function createMcpToolDefinitions(
   settings: McpSettings,
   fetcher: typeof fetch = fetch,
   snapshots?: Map<string, McpServerSnapshot>,
+  options: McpToolDefinitionOptions = {},
 ): Promise<ToolDefinition[]> {
-  if (snapshots) return createMcpToolDefinitionsFromSnapshots(settings, snapshots);
+  if (snapshots) return createMcpToolDefinitionsFromSnapshots(settings, snapshots, options);
 
   const generatedSnapshots = new Map<string, McpServerSnapshot>();
   await Promise.all(
@@ -64,16 +98,18 @@ export async function createMcpToolDefinitions(
       const snapshot = await inspectMcpServer(serverName, server, fetcher, {
         defaultTimeoutMs: settings.defaultTimeoutMs,
         ttlMs: 0,
+        authProvider: options.authProviderFactory?.(serverName, server),
       });
       generatedSnapshots.set(serverName, snapshot);
     }),
   );
-  return createMcpToolDefinitionsFromSnapshots(settings, generatedSnapshots);
+  return createMcpToolDefinitionsFromSnapshots(settings, generatedSnapshots, options);
 }
 
 export function createMcpToolDefinitionsFromSnapshots(
   settings: McpSettings,
   snapshots: Map<string, McpServerSnapshot>,
+  options: McpToolDefinitionOptions = {},
 ) {
   const tools: ToolDefinition[] = [];
   const usedNames = new Set<string>();
@@ -87,7 +123,7 @@ export function createMcpToolDefinitionsFromSnapshots(
       const baseName = `mcp_${sanitizeToolName(serverName)}_${sanitizeToolName(mcpTool.name)}`;
       const name = uniqueName(baseName, usedNames);
       usedNames.add(name);
-      tools.push(toToolDefinition(name, serverName, server, mcpTool, settings.defaultTimeoutMs));
+      tools.push(toToolDefinition(name, serverName, server, mcpTool, settings.defaultTimeoutMs, options));
     }
   }
 
@@ -98,7 +134,7 @@ export async function inspectMcpServer(
   serverName: string,
   server: RemoteMcpServer,
   fetcher: typeof fetch,
-  options: { defaultTimeoutMs?: number; ttlMs: number },
+  options: McpClientOptions & { ttlMs: number },
 ): Promise<McpServerSnapshot> {
   const signature = mcpServerSignature(server, options.defaultTimeoutMs);
   const checkedAt = Date.now();
@@ -109,6 +145,7 @@ export async function inspectMcpServer(
     checkedAt,
     cached: false,
     headerNames: Object.keys(server.headers ?? {}),
+    ...(options.oauthStatus ? { oauth: options.oauthStatus } : {}),
   };
 
   if (server.disabled) {
@@ -133,6 +170,7 @@ export async function inspectMcpServer(
           listRemotePrompts(client, timeout),
           listRemoteResources(client, timeout),
         ]);
+        const capabilities = client.getServerCapabilities();
         const status: McpServerStatus = {
           ...baseStatus,
           status: "connected",
@@ -140,6 +178,11 @@ export async function inspectMcpServer(
           toolCount: tools.length,
           promptCount: prompts.length,
           resourceCount: resources.length,
+          listChanged: {
+            tools: capabilities?.tools?.listChanged,
+            prompts: capabilities?.prompts?.listChanged,
+            resources: capabilities?.resources?.listChanged,
+          },
         };
         return {
           serverName,
@@ -152,8 +195,20 @@ export async function inspectMcpServer(
           resources,
         };
       },
+      { ...options, serverName },
     );
   } catch (error) {
+    if (error instanceof UnauthorizedError) {
+      const status: McpServerStatus = {
+        ...baseStatus,
+        status: "needs_auth",
+        error: error.message,
+        toolCount: 0,
+        promptCount: 0,
+        resourceCount: 0,
+      };
+      return emptySnapshot(serverName, signature, checkedAt, options.ttlMs, status);
+    }
     const status: McpServerStatus = {
       ...baseStatus,
       status: "failed",
@@ -171,11 +226,12 @@ export async function readMcpResource(
   resourceUri: string,
   fetcher: typeof fetch,
   defaultTimeoutMs?: number,
+  authProvider?: OAuthClientProvider,
 ) {
   return withMcpClient(server, fetcher, defaultTimeoutMs, async (client, timeout) => {
     const result = await client.readResource({ uri: resourceUri }, { timeout });
     return summarizeMcpResult(result);
-  });
+  }, { authProvider });
 }
 
 export async function getMcpPrompt(
@@ -184,11 +240,12 @@ export async function getMcpPrompt(
   args: Record<string, string> | undefined,
   fetcher: typeof fetch,
   defaultTimeoutMs?: number,
+  authProvider?: OAuthClientProvider,
 ) {
   return withMcpClient(server, fetcher, defaultTimeoutMs, async (client, timeout) => {
     const result = await client.getPrompt({ name, arguments: args }, { timeout });
     return summarizeMcpResult(result);
-  });
+  }, { authProvider });
 }
 
 export function mcpServerSignature(server: RemoteMcpServer, defaultTimeoutMs?: number) {
@@ -208,6 +265,7 @@ function toToolDefinition(
   server: RemoteMcpServer,
   mcpTool: McpToolDefinition,
   defaultTimeoutMs?: number,
+  options: McpToolDefinitionOptions = {},
 ): ToolDefinition<Record<string, unknown>, unknown> {
   return {
     name,
@@ -225,7 +283,14 @@ function toToolDefinition(
       label: `MCP ${serverName}:${mcpTool.name}`,
     },
     execute: async (ctx, input) =>
-      callRemoteTool(server, mcpTool.name, input, ctx.fetch ?? fetch, defaultTimeoutMs),
+      callRemoteTool(
+        server,
+        mcpTool.name,
+        input,
+        ctx.fetch ?? fetch,
+        defaultTimeoutMs,
+        options.authProviderFactory?.(serverName, server),
+      ),
   };
 }
 
@@ -296,6 +361,7 @@ async function callRemoteTool(
   input: Record<string, unknown>,
   fetcher: typeof fetch,
   defaultTimeoutMs?: number,
+  authProvider?: OAuthClientProvider,
 ) {
   return withMcpClient(server, fetcher, defaultTimeoutMs, async (client, timeout) => {
     const result = await client.callTool(
@@ -307,7 +373,7 @@ async function callRemoteTool(
       { timeout },
     );
     return formatMcpToolResult(toolName, result);
-  });
+  }, { authProvider });
 }
 
 async function withMcpClient<T>(
@@ -315,10 +381,12 @@ async function withMcpClient<T>(
   fetcher: typeof fetch,
   defaultTimeoutMs: number | undefined,
   fn: (client: Client, timeout: number, transport: McpTransportName) => Promise<T>,
+  options: Pick<McpClientOptions, "authProvider" | "onActivity" | "serverName"> = {},
 ) {
   const timeout = server.timeoutMs ?? defaultTimeoutMs ?? DEFAULT_MCP_TIMEOUT_MS;
   const url = new URL(server.url);
   const requestInit = server.headers ? { headers: server.headers } : undefined;
+  const authProvider = options.authProvider;
   const transportFactories: Array<{
     name: McpTransportName;
     create: () => StreamableHTTPClientTransport | SSEClientTransport;
@@ -329,6 +397,7 @@ async function withMcpClient<T>(
         new StreamableHTTPClientTransport(url, {
           fetch: fetcher,
           requestInit,
+          authProvider,
         }),
     },
     {
@@ -337,6 +406,7 @@ async function withMcpClient<T>(
         new SSEClientTransport(url, {
           fetch: withDefaultHeaders(fetcher, server.headers),
           requestInit,
+          authProvider,
         }),
     },
   ];
@@ -348,6 +418,19 @@ async function withMcpClient<T>(
       { name: MCP_CLIENT_NAME, version: MCP_CLIENT_VERSION },
       { capabilities: {} },
     );
+    client.setNotificationHandler(LoggingMessageNotificationSchema, (notification) => {
+      options.onActivity?.({
+        type: "mcp_server_log",
+        serverName: options.serverName ?? "unknown",
+        message: String(notification.params.data ?? "MCP server log"),
+        data: {
+          level: notification.params.level,
+          logger: notification.params.logger,
+          data: notification.params.data,
+        },
+      });
+      return Promise.resolve();
+    });
 
     try {
       await client.connect(transport, { timeout });
